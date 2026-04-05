@@ -1,0 +1,25 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments (MUITO IMPORTANTE)
+env/
+venv/
+.env
+.venv/
+xxx.env
+*.env
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# IDE specific settings (Opcional, mas recomendado)
+.vscode/
+.idea/
+
+# IDE specific settings (Opcional, mas recomendado)
+.pdf
+.docx
