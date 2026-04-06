@@ -42,7 +42,7 @@ def gerar_relatorio(diretorio_raiz, arquivo_saida, extensoes=None):
 
 # Uso
 diretorio = r'C:\Users\usuario\Python\DrTilapIA'
-extensoes_desejadas = ('.py',)
+extensoes_desejadas = ('.py', '.yml', '.Dockerfile', )
 nome_saida = f"{os.path.basename(diretorio)}_relatorio_completo.txt"
 
 gerar_relatorio(diretorio, nome_saida, extensoes=extensoes_desejadas)

@@ -1,0 +1,40 @@
+services:
+  # Serviço do Backend (Cérebro do Dr. Tilápia)
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: dr_tilapia_api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ./.env:/app/.env
+    env_file:
+      - .env
+    restart: always
+    networks:
+      - tilapia_net
+
+  # Serviço do Frontend (Rosto do Dr. Tilápia)
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend.Dockerfile
+    container_name: dr_tilapia_ui
+    ports:
+      - "3000:3000"
+      - "8001:8001"
+    volumes:
+      - ./frontend:/app
+    environment:
+      - API_URL=http://localhost:8000
+    depends_on:
+      - api
+    restart: always
+    networks:
+      - tilapia_net
+
+networks:
+  tilapia_net:
+    driver: bridge

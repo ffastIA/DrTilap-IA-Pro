@@ -1,78 +1,113 @@
 import os
 import logging
-from pathlib import Path
-from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
+from typing import List, Tuple, Dict, Any
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import SupabaseVectorStore
 from langchain.chains import ConversationalRetrievalChain
-from langchain.prompts import PromptTemplate
-from backend.app.database import supabase
+from app.database import supabase
 
-# Configurar logging
+# Configuração de Logging para monitoramento no Docker
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("RAGService")
 
 
 class RAGService:
     def __init__(self):
-        # Carregar .env com caminho absoluto baseado na raiz do projeto (backend/)
-        backend_root = Path(__file__).parent.parent.parent  # backend/app/services -> backend/
-        env_path = backend_root / '.env'
-        load_dotenv(dotenv_path=env_path)
+        """
+        Inicializa os componentes de IA e a conexão com o banco vetorial.
+        """
+        # Embeddings: Transforma texto em vetores numéricos
+        self.embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
-        # Verificação robusta da API Key
-        self.openai_api_key = os.getenv('OPENAI_API_KEY')
-        if not self.openai_api_key:
-            raise ValueError(
-                "OPENAI_API_KEY não encontrada no arquivo .env. Verifique o caminho absoluto e a presença da variável.")
+        # LLM: O cérebro que gera as respostas (GPT-4o)
+        self.llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
+        # Vector Store: Conexão com a tabela 'documents' no Supabase
+        self.vector_store = SupabaseVectorStore(
+            client=supabase,
+            embedding=self.embeddings,
+            table_name="documents",
+            query_name="match_documents",
+        )
+
+    async def ingest_pdf(self, file_path: str, filename: str) -> int:
+        """
+        Processa um PDF: Carrega -> Divide em Chunks -> Vetoriza -> Salva.
+        """
         try:
-            # Configurar ChatOpenAI
-            self.llm = ChatOpenAI(model="gpt-5-nano", temperature=0, openai_api_key=self.openai_api_key)
+            logger.info(f"Iniciando processamento do PDF: {filename}")
 
-            # Configurar SupabaseVectorStore
-            self.vectorstore = SupabaseVectorStore(
-                client=supabase,
-                table_name="documents",
-                embedding=None,  # Assumindo que embeddings são gerenciados externamente ou via pgvector
-                query_name="match_documents"
+            # 1. Carregamento
+            loader = PyPDFLoader(file_path)
+            documents = loader.load()
+
+            # 2. Divisão em pedaços (Chunking)
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=100,
+                separators=["\n\n", "\n", ".", " ", ""]
             )
+            chunks = text_splitter.split_documents(documents)
 
-            # Configurar ConversationalRetrievalChain
-            self.qa_chain = ConversationalRetrievalChain.from_llm(
+            # 3. Adição de Metadados para rastreabilidade
+            for chunk in chunks:
+                chunk.metadata = {
+                    "source": filename,
+                    "type": "documentacao_tecnica"
+                }
+
+            # 4. Persistência no pgvector
+            self.vector_store.add_documents(chunks)
+
+            logger.info(f"Sucesso: {len(chunks)} chunks salvos para {filename}")
+            return len(chunks)
+
+        except Exception as e:
+            logger.error(f"Falha na ingestão do arquivo {filename}: {str(e)}")
+            raise e
+
+    async def get_answer(self, question: str, chat_history: List[Tuple[str, str]] = []) -> Dict[str, Any]:
+        """
+        Realiza a busca semântica e gera a resposta baseada no contexto.
+        """
+        try:
+            logger.info(f"Processando pergunta: {question}")
+
+            # Configura a Chain de Recuperação
+            chain = ConversationalRetrievalChain.from_llm(
                 llm=self.llm,
-                retriever=self.vectorstore.as_retriever(),
+                retriever=self.vector_store.as_retriever(search_kwargs={"k": 4}),
                 return_source_documents=True
             )
 
-            logger.info("RAGService inicializado com sucesso.")
+            # Executa a busca e geração
+            result = chain.invoke({
+                "question": question,
+                "chat_history": chat_history
+            })
+
+            # Extrai as fontes únicas encontradas
+            sources = list(set([
+                doc.metadata.get("source", "Fonte desconhecida")
+                for doc in result["source_documents"]
+            ]))
+
+            return {
+                "answer": result["answer"],
+                "sources": sources
+            }
+
         except Exception as e:
-            logger.error(f"Erro ao inicializar RAGService: {str(e)}")
-            raise
+            # ALTERAÇÃO PARA DEBUG: Retornando o erro real no corpo da resposta
+            logger.error(f"CRITICAL ERROR no RAG: {str(e)}")
+            return {
+                "answer": f"Erro Técnico Detectado: {str(e)}",
+                "sources": [],
+                "debug_info": "Verifique a API Key da OpenAI ou a função match_documents no Supabase."
+            }
 
-    def query(self, question: str, user_id: str, chat_history: list = None):
-        """
-        Realiza uma consulta com contexto filtrado por user_id.
-        """
-        if chat_history is None:
-            chat_history = []
 
-        try:
-            # Filtrar documentos por user_id nos metadados
-            retriever = self.vectorstore.as_retriever(
-                search_kwargs={"filter": {"metadata->>user_id": user_id}}
-            )
-
-            # Atualizar a chain com o retriever filtrado
-            qa_chain = ConversationalRetrievalChain.from_llm(
-                llm=self.llm,
-                retriever=retriever,
-                return_source_documents=True
-            )
-
-            result = qa_chain({"question": question, "chat_history": chat_history})
-            logger.info(f"Consulta realizada com sucesso para user_id: {user_id}")
-            return result
-        except Exception as e:
-            logger.error(f"Erro na consulta para user_id {user_id}: {str(e)}")
-            raise
+# Instância Singleton
+rag_service = RAGService()

@@ -1,68 +1,48 @@
 import reflex as rx
 import httpx
+import json
+from typing import List, Tuple
 
 
 class State(rx.State):
-    access_token: str = rx.LocalStorage("")
-    user_role: str = rx.LocalStorage("")
-    user_email: str = ""
-    password: str = ""
-    user_name: str = "Usuário"
-    is_authenticated: bool = False
-    files_to_upload: list[str] = []
-    upload_status: str = ""
-    reindex_status: str = ""
+    # Lista de mensagens: [("pergunta", "resposta"), ...]
+    chat_history: List[List[str]] = []
+    current_message: str = ""
     is_loading: bool = False
 
-    def check_login(self):
-        if not self.access_token:
-            return rx.redirect("/login")
+    async def answer(self):
+        if not self.current_message:
+            return
 
-    async def handle_login(self):
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "http://localhost:8080/auth/login",
-                json={"email": self.user_email, "password": self.password}
-            )
-            if response.status_code == 200:
-                data = response.json()
-                self.access_token = data.get("access_token")
-                self.user_role = data.get("role")
-                self.is_authenticated = True
-                return rx.redirect("/hub")
-            else:
-                self.upload_status = "Erro no login"
-
-    def logout(self):
-        self.access_token = ""
-        self.user_role = ""
-        self.is_authenticated = False
-        return rx.redirect("/login")
-
-    async def handle_upload(self, files: list[rx.UploadFile]):
         self.is_loading = True
-        async with httpx.AsyncClient() as client:
-            for file in files:
+        yield  # Atualiza a UI para mostrar o estado de carregamento
+
+        # Prepara a pergunta e limpa o campo de input
+        user_question = self.current_message
+        self.current_message = ""
+
+        # Adiciona a pergunta do usuário ao chat imediatamente
+        self.chat_history.append([user_question, "Pensando..."])
+        yield
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
                 response = await client.post(
-                    "http://localhost:8080/admin/upload",
-                    files={"file": (file.filename, file.file, file.content_type)},
-                    headers={"Authorization": f"Bearer {self.access_token}"}
+                    "http://localhost:8000/consultoria/chat",
+                    json={
+                        "message": user_question,
+                        "history": self.chat_history[:-1]  # Envia o histórico anterior
+                    }
                 )
-                if response.status_code == 200:
-                    self.upload_status = "Upload bem-sucedido"
-                else:
-                    self.upload_status = "Erro no upload"
-        self.is_loading = False
 
-    async def reindex_vectorstore(self):
-        self.is_loading = True
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "http://localhost:8080/admin/reindex",
-                headers={"Authorization": f"Bearer {self.access_token}"}
-            )
-            if response.status_code == 200:
-                self.reindex_status = "Reindexação bem-sucedida"
-            else:
-                self.reindex_status = "Erro na reindexação"
+                if response.status_code == 200:
+                    data = response.json()
+                    # Atualiza a última mensagem com a resposta real da IA
+                    self.chat_history[-1][1] = data["answer"]
+                else:
+                    self.chat_history[-1][1] = "Erro ao conectar com o consultor."
+        except Exception as e:
+            self.chat_history[-1][1] = f"Erro de conexão: {str(e)}"
+
         self.is_loading = False
+        yield
