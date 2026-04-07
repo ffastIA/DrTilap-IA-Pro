@@ -1,4 +1,5 @@
 import type { Config } from 'tailwindcss';
+import { poppins } from './lib/fonts';
 
 const config: Config = {
   content: [
@@ -8,16 +9,25 @@ const config: Config = {
   ],
   theme: {
     extend: {
-      colors: {
-        primary: '#004e92',
-        accent: '#ff7f50',
-        secondary: '#00ced1',
+      fontFamily: {
+        poppins: ['var(--font-poppins)', 'sans-serif'],
       },
-      backgroundImage: {
-        'gradient-radial': 'radial-gradient(var(--tw-gradient-stops))',
+      colors: {
+        primary: '#00C853',
+        secondary: '#2196F3',
+        accent: '#FFC107',
+        background: '#1A1A1A',
+        surface: '#2C2C2C',
+        text: '#E0E0E0',
+        textSecondary: '#B0B0B0',
+        error: '#D32F2F',
+        success: '#388E3C',
+        warning: '#FBC02D',
+        info: '#0288D1',
       },
     },
   },
   plugins: [],
 };
+
 export default config;

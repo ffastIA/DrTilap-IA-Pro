@@ -1,28 +1,25 @@
+// app/layout.tsx
 import type { Metadata } from 'next';
+import { poppins } from '@/lib/fonts';
 import '@/styles/globals.css';
-import { Providers } from './providers';
+import AuthProvider from '@/components/AuthProvider';
 
 export const metadata: Metadata = {
-  title: 'Dr. Tilápia 2.0',
-  description: 'Consultoria IA para Piscicultura Tecnológica',
-  icons: {
-    icon: '/favicon.ico',
-  },
+  title: 'Dr. Tilápia 2.0 - Consultoria de IA',
+  description: 'Seu assistente inteligente para piscicultura e aquacultura.',
 };
 
 export default function RootLayout({
   children,
-}: {
+}: Readonly<{
   children: React.ReactNode;
-}) {
+}>) {
   return (
-    <html lang="pt-BR" suppressHydrationWarning>
-      <head>
-        <meta charSet="utf-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-      </head>
-      <body className="bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
-        <Providers>{children}</Providers>
+    <html lang="pt-BR">
+      <body className={`${poppins.variable} font-poppins`}>
+        <AuthProvider>
+          {children}
+        </AuthProvider>
       </body>
     </html>
   );

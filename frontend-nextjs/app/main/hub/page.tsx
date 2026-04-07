@@ -1,132 +1,79 @@
 'use client';
 
+import React from 'react';
 import Link from 'next/link';
-import { useAuth } from '@/hooks/useAuth';
-import { useRouter } from 'next/navigation';
-import { authApi } from '@/lib/api';
+import { MessageSquareTextIcon, UploadCloudIcon, BarChart2Icon, UserIcon } from 'lucide-react';
 import { useAuthStore } from '@/store/authStore';
-import { useState } from 'react';
+
+const FeatureCard: React.FC<{
+  icon: React.ElementType;
+  title: string;
+  description: string;
+  href: string;
+  disabled?: boolean;
+}> = ({ icon: Icon, title, description, href, disabled }) => (
+  <Link href={href} className={`block ${disabled ? 'pointer-events-none opacity-50' : ''}`}>
+    <div className="glass-effect p-6 rounded-lg flex flex-col items-center text-center h-full transition-all duration-300 hover:scale-105 hover:shadow-xl">
+      <Icon size={48} className="text-primary mb-4" />
+      <h3 className="text-xl font-semibold text-white mb-2">{title}</h3>
+      <p className="text-text-secondary text-sm">{description}</p>
+    </div>
+  </Link>
+);
 
 export default function HubPage() {
-  const { user } = useAuth();
-  const { clearAuth } = useAuthStore();
-  const router = useRouter();
-  const [isLoggingOut, setIsLoggingOut] = useState(false);
-
-  const handleLogout = async () => {
-    setIsLoggingOut(true);
-    authApi.logout();
-    clearAuth();
-
-    // Aguardar um pouco antes de redirecionar
-    setTimeout(() => {
-      router.push('/');
-    }, 300);
-  };
-
-  const userEmail = user?.email || 'Usuário';
-  const userName = userEmail.split('@')[0].charAt(0).toUpperCase() + userEmail.split('@')[0].slice(1);
+  const user = useAuthStore((state) => state.user);
   const isAdmin = user?.role === 'admin';
 
   return (
-    <div className="min-h-screen relative overflow-hidden bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
-      {/* Background Image com Overlay */}
-      <div
-        className="fixed inset-0 -z-10"
-        style={{
-          backgroundImage: "url('/hub01.jpeg')",
-          backgroundSize: 'cover',
-          backgroundPosition: 'center',
-          filter: 'brightness(0.4) blur(4px)',
-        }}
-      />
+    <div className="p-8">
+      <h1 className="text-4xl font-bold text-white mb-4">Bem-vindo, {user?.email}!</h1>
+      <p className="text-text-secondary text-lg mb-8">
+        Explore as funcionalidades do Dr. Tilápia, seu assistente de IA para piscicultura.
+      </p>
 
-      {/* Header com Logout */}
-      <div className="absolute top-0 left-0 right-0 z-50 flex justify-between items-center p-6 bg-gradient-to-b from-black/50 to-transparent">
-        <div>
-          <h1 className="text-3xl font-bold text-white">
-            🐟 Dr. Tilápia
-          </h1>
-        </div>
-        <button
-          onClick={handleLogout}
-          disabled={isLoggingOut}
-          className="px-6 py-2 bg-red-600 hover:bg-red-700 disabled:bg-red-800 text-white font-semibold rounded-lg transition-all duration-300 disabled:cursor-not-allowed"
-        >
-          {isLoggingOut ? 'Saindo...' : 'Sair'}
-        </button>
-      </div>
-
-      {/* Welcome Section */}
-      <div className="absolute top-32 left-12 z-40">
-        <h2 className="text-5xl font-bold text-white mb-2">
-          Olá, {userName}! 👋
-        </h2>
-        <p className="text-slate-300 text-lg">
-          Bem-vindo ao Hub de Ferramentas Dr. Tilápia
-        </p>
-        {isAdmin && (
-          <span className="inline-block mt-3 px-3 py-1 bg-yellow-500/20 border border-yellow-500/50 text-yellow-200 text-xs font-semibold rounded-full">
-            👑 Administrador
-          </span>
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        <FeatureCard
+          icon={MessageSquareTextIcon}
+          title="Consultoria de IA"
+          description="Obtenha respostas instantâneas e insights especializados sobre piscicultura."
+          href="/main/consultoria"
+        />
+        <FeatureCard
+          icon={BarChart2Icon}
+          title="Dashboard de Métricas"
+          description="Visualize dados e métricas importantes para otimizar sua produção."
+          href="/main/dashboard"
+        />
+        {isAdmin ? (
+          <FeatureCard
+            icon={UploadCloudIcon}
+            title="Administração RAG"
+            description="Gerencie e faça upload de documentos para a base de conhecimento da IA."
+            href="/main/admin"
+          />
+        ) : (
+          <FeatureCard
+            icon={UploadCloudIcon}
+            title="Administração RAG"
+            description="Funcionalidade exclusiva para administradores."
+            href="#"
+            disabled
+          />
         )}
+        <FeatureCard
+          icon={UserIcon}
+          title="Meu Perfil"
+          description="Visualize e edite suas informações de usuário e preferências."
+          href="/main/profile"
+        />
       </div>
 
-      {/* Cards Container */}
-      <div className="relative w-full h-screen flex items-center justify-center px-4">
-        <div className="flex flex-wrap gap-8 justify-center max-w-5xl">
-          {/* Card: Consultoria */}
-          <Link href="/main/consultoria">
-            <div className="group cursor-pointer w-72 h-48 glass p-8 flex flex-col justify-center items-center text-center hover:scale-110 hover:shadow-2xl transition-all duration-300 hover:bg-opacity-20 rounded-2xl">
-              <div className="text-6xl mb-4 group-hover:scale-125 transition-transform duration-300">
-                💬
-              </div>
-              <h3 className="text-2xl font-bold text-white mb-2">
-                Consultoria IA
-              </h3>
-              <p className="text-slate-300 text-sm">
-                Chat interativo com análise de manuais técnicos via RAG
-              </p>
-            </div>
-          </Link>
-
-          {/* Card: Dashboard */}
-          <Link href="/main/dashboard">
-            <div className="group cursor-pointer w-72 h-48 glass p-8 flex flex-col justify-center items-center text-center hover:scale-110 hover:shadow-2xl transition-all duration-300 hover:bg-opacity-20 rounded-2xl">
-              <div className="text-6xl mb-4 group-hover:scale-125 transition-transform duration-300">
-                📊
-              </div>
-              <h3 className="text-2xl font-bold text-white mb-2">
-                Dashboard
-              </h3>
-              <p className="text-slate-300 text-sm">
-                Métricas e estatísticas em tempo real do sistema
-              </p>
-            </div>
-          </Link>
-
-          {/* Card: Admin (Condicional) */}
-          {isAdmin && (
-            <Link href="/main/admin">
-              <div className="group cursor-pointer w-72 h-48 glass p-8 flex flex-col justify-center items-center text-center hover:scale-110 hover:shadow-2xl transition-all duration-300 hover:bg-opacity-20 rounded-2xl">
-                <div className="text-6xl mb-4 group-hover:scale-125 transition-transform duration-300">
-                  ⚙️
-                </div>
-                <h3 className="text-2xl font-bold text-white mb-2">
-                  Administração
-                </h3>
-                <p className="text-slate-300 text-sm">
-                  Upload de documentos e gestão da base de conhecimento
-                </p>
-              </div>
-            </Link>
-          )}
+      <div className="mt-12">
+        <h2 className="text-3xl font-bold text-white mb-6">Atividades Recentes</h2>
+        <div className="glass-effect p-6 rounded-lg">
+          <p className="text-text-secondary">Nenhuma atividade recente para exibir.</p>
         </div>
-      </div>
-
-      {/* Footer Info */}
-      <div className="absolute bottom-6 left-0 right-0 text-center text-xs text-slate-500">
-        <p>Dr. Tilápia 2.0 | Powered by Next.js + FastAPI + Supabase</p>
       </div>
     </div>
   );

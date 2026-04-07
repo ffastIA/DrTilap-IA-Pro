@@ -1,16 +1,28 @@
-import { useEffect } from 'react';
+// hooks/useAuth.ts
 import { useAuthStore } from '@/store/authStore';
 
 export const useAuth = () => {
-  const { token, user, isAuthenticated, restoreAuth } = useAuthStore();
-
-  useEffect(() => {
-    restoreAuth();
-  }, [restoreAuth]);
+  const { user, token, isAuthenticated, isLoading, login, logout, updateUser } = useAuthStore(
+    (state) => ({
+      user: state.user,
+      token: state.token,
+      isAuthenticated: state.isAuthenticated,
+      isLoading: state.isLoading,
+      login: state.login,
+      logout: state.logout,
+      updateUser: state.updateUser,
+    })
+  );
 
   return {
-    token,
     user,
+    token,
     isAuthenticated,
+    isLoading,
+    login,
+    logout,
+    updateUser,
   };
 };
+
+export default useAuth;
