@@ -45,7 +45,7 @@ def message_box(chat: list) -> rx.Component:
     )
 
 
-def consultoria_page() -> rx.Component:
+def consultoria() -> rx.Component:
     return rx.center(
         # Background Imersivo
         rx.box(
