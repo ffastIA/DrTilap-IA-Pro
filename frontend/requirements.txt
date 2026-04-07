@@ -1,6 +1,0 @@
-reflex==0.3.16
-sqlalchemy==2.0.29
-sqlmodel==0.0.16
-httpx==0.25.2
-python-dotenv==1.0.1
-packaging==23.2
