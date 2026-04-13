@@ -16,16 +16,15 @@ from app.services.vector_admin_service import vector_admin_service
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('DrTilapiaAPI')
-
 app = FastAPI(title='Dr. Tilápia 2.0 API', version='2.1.0')
 
 # Configuração de CORS aberta
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['*'],
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=['*'],
-    allow_headers=['*'],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 class LoginRequest(BaseModel):
@@ -40,21 +39,15 @@ UPLOAD_DIR = Path('temp_uploads')
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 @app.get('/health')
-def health():
+async def health():
     return {'status': 'online', 'version': app.version}
 
 @app.post('/auth/login')
 async def login(data: LoginRequest):
-    try:
-        result = await auth_service.login(data.email, data.password)
-        if not result:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='E-mail ou senha incorretos')
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f'Erro inesperado no login: {str(e)}')
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail='Erro interno no servidor')
+    result = await auth_service.login(data.email, data.password)
+    if not result:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='E-mail ou senha incorretos')
+    return result
 
 @app.post('/admin/upload')
 async def upload_document(file: UploadFile = File(...), current_admin: dict = Depends(get_current_admin_user)):
@@ -77,43 +70,76 @@ async def upload_document(file: UploadFile = File(...), current_admin: dict = De
 
 @app.post('/consultoria/chat')
 async def chat(data: ChatRequest):
+    formatted_history = [tuple(h) for h in data.history]
     try:
-        formatted_history = [tuple(h) for h in data.history]
         response = await rag_service.get_answer(data.message, formatted_history)
         return response
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f'Erro interno no chat: {str(e)}')
+        logger.error(f'Erro interno: {str(e)}')
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f'Erro interno: {str(e)}')
 
 @app.get('/admin/vector-base/files')
-def list_files(current_admin: dict = Depends(get_current_admin_user)):
+async def list_files(current_admin: dict = Depends(get_current_admin_user)):
     return vector_admin_service.list_files()
 
 @app.get('/admin/vector-base/files/{original_file_id}')
-def get_file_detail(original_file_id: str, current_admin: dict = Depends(get_current_admin_user)):
+async def get_file_detail(original_file_id: str, current_admin: dict = Depends(get_current_admin_user)):
     try:
         return vector_admin_service.get_file_detail(original_file_id)
     except ValueError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Arquivo não encontrado')
+    except Exception as e:
+        logger.error(f'Erro interno do servidor: {str(e)}')
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail='Erro interno do servidor')
 
 @app.post('/admin/vector-base/files/{original_file_id}/delete')
 async def delete_file(original_file_id: str, body: DeleteFileRequest, current_admin: dict = Depends(get_current_admin_user)):
     if body.original_file_id != original_file_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='O original_file_id do corpo deve ser igual ao da URL.')
-    result = vector_admin_service.delete_by_file(original_file_id=original_file_id, deleted_by=current_admin.get('id'), hard_delete=body.hard_delete, reason=body.reason)
-    return result
+    try:
+        result = vector_admin_service.delete_by_file(
+            original_file_id=original_file_id,
+            deleted_by=current_admin.get('id'),
+            hard_delete=body.hard_delete,
+            reason=body.reason,
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f'Erro interno do servidor: {str(e)}')
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail='Erro interno do servidor')
 
 @app.post('/admin/vector-base/cleanup')
 async def cleanup(body: CleanupRequest, current_admin: dict = Depends(get_current_admin_user)):
-    result = vector_admin_service.cleanup_all(deleted_by=current_admin.get('id'), hard_delete=body.hard_delete, reason=body.reason)
-    return result
+    try:
+        result = vector_admin_service.cleanup_all(
+            deleted_by=current_admin.get('id'),
+            hard_delete=body.hard_delete,
+            reason=body.reason,
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f'Erro interno do servidor: {str(e)}')
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail='Erro interno do servidor')
 
 @app.post('/admin/vector-base/reindex')
 async def reindex(body: ReindexRequest, current_admin: dict = Depends(get_current_admin_user)):
-    result = await vector_admin_service.reindex_files(original_file_ids=body.original_file_ids, requested_by=current_admin.get('id'))
-    return result
+    try:
+        result = await vector_admin_service.reindex_files(
+            original_file_ids=body.original_file_ids,
+            requested_by=current_admin.get('id'),
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f'Erro interno do servidor: {str(e)}')
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail='Erro interno do servidor')
 
 if __name__ == '__main__':
     import uvicorn

@@ -1,71 +1,63 @@
 # CAMINHO: backend/app/vector_admin_schemas.py
 # ARQUIVO: vector_admin_schemas.py
 
-from typing import List, Optional
-from pydantic import BaseModel, Field
+from typing import Any, Dict, List, Optional
 from typing import Literal
+from pydantic import BaseModel, Field
 
-# Frases fixas para confirmação de operações administrativas
+# Constantes para frases de confirmação obrigatórias
 CONFIRMAR_EXCLUSAO = 'CONFIRMAR_EXCLUSAO'
 CONFIRMAR_LIMPEZA_TOTAL = 'CONFIRMAR_LIMPEZA_TOTAL'
 CONFIRMAR_REINDEXACAO = 'CONFIRMAR_REINDEXACAO'
 
 
 class DeleteFileRequest(BaseModel):
-    """
-    Schema para requisição de exclusão de um arquivo vetorial específico.
-    """
+    # Requisição para exclusão seletiva de arquivo vetorial
     original_file_id: str = Field(..., description="ID do arquivo original a ser excluído")
     confirmation_phrase: Literal['CONFIRMAR_EXCLUSAO'] = Field(..., description="Frase de confirmação obrigatória")
-    reason: Optional[str] = Field(None, description="Razão opcional para a exclusão")
-    hard_delete: bool = Field(False, description="Se verdadeiro, realiza exclusão física")
+    reason: Optional[str] = Field(default=None, description="Motivo opcional da exclusão")
+    hard_delete: bool = Field(default=False, description="Se verdadeiro, realiza exclusão física")
 
 
 class CleanupRequest(BaseModel):
-    """
-    Schema para requisição de limpeza total da base vetorial.
-    """
+    # Requisição para limpeza geral da base vetorial
     confirmation_phrase: Literal['CONFIRMAR_LIMPEZA_TOTAL'] = Field(..., description="Frase de confirmação obrigatória")
-    reason: Optional[str] = Field(None, description="Razão opcional para a limpeza")
-    hard_delete: bool = Field(False, description="Se verdadeiro, realiza exclusão física")
+    reason: Optional[str] = Field(default=None, description="Motivo opcional da limpeza")
+    hard_delete: bool = Field(default=False, description="Se verdadeiro, realiza exclusão física")
 
 
 class ReindexRequest(BaseModel):
-    """
-    Schema para requisição de reindexação da base vetorial.
-    """
+    # Requisição para reindexação da base vetorial
     confirmation_phrase: Literal['CONFIRMAR_REINDEXACAO'] = Field(..., description="Frase de confirmação obrigatória")
-    original_file_ids: Optional[List[str]] = Field(None, description="Lista opcional de IDs de arquivos originais para reindexar")
+    original_file_ids: Optional[List[str]] = Field(default=None, description="Lista opcional de IDs de arquivos para reindexar")
 
 
 class VectorFileSummary(BaseModel):
-    """
-    Schema para resumo de um arquivo vetorial.
-    """
-    original_file_id: str = Field(..., description="ID do arquivo original")
-    original_file_name: str = Field(..., description="Nome do arquivo original")
-    storage_bucket: str = Field(..., description="Bucket de armazenamento")
-    storage_path: str = Field(..., description="Caminho no armazenamento")
-    total_chunks: int = Field(..., description="Número total de chunks")
-    active_chunks: int = Field(..., description="Número de chunks ativos")
-    deleted_chunks: int = Field(..., description="Número de chunks deletados")
-    deleted_at: Optional[str] = Field(None, description="Data de exclusão, se aplicável")
-    last_ingested_at: str = Field(..., description="Última data de ingestão")
-    status: str = Field(..., description="Status do arquivo (ex: ativo, deletado)")
+    # Resumo de arquivo vetorial
+    original_file_id: str
+    original_file_name: Optional[str] = None
+    storage_bucket: Optional[str] = None
+    storage_path: Optional[str] = None
+    total_chunks: int = 0
+    active_chunks: int = 0
+    deleted_chunks: int = 0
+    deleted_at: Optional[str] = None
+    last_ingested_at: Optional[str] = None
+    status: str = 'unknown'
 
 
 class VectorFileDetail(VectorFileSummary):
-    """
-    Schema para detalhes de um arquivo vetorial, herdando de VectorFileSummary.
-    """
-    # Pode adicionar campos adicionais aqui se necessário, por enquanto herda tudo
-    pass
+    # Detalhes completos de arquivo vetorial, herdando de VectorFileSummary
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class VectorOperationResponse(BaseModel):
-    """
-    Schema para resposta de operações administrativas na base vetorial.
-    """
-    message: str = Field(..., description="Mensagem da operação")
-    status: str = Field(..., description="Status da operação (ex: sucesso, erro)")
-    details: dict = Field(..., description="Detalhes adicionais da operação")
+    # Resposta para operações administrativas na base vetorial
+    message: str
+    status: str
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
+class VectorFileListResponse(BaseModel):
+    # Resposta para listagem de arquivos vetoriais
+    files: List[VectorFileSummary] = Field(default_factory=list)
