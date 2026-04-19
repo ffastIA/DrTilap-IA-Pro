@@ -1,63 +1,169 @@
 # CAMINHO: backend/app/vector_admin_schemas.py
-# ARQUIVO: vector_admin_schemas.py
 
-from typing import Any, Dict, List, Optional
-from typing import Literal
+from datetime import datetime
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
-
-# Constantes para frases de confirmação obrigatórias
-CONFIRMAR_EXCLUSAO = 'CONFIRMAR_EXCLUSAO'
-CONFIRMAR_LIMPEZA_TOTAL = 'CONFIRMAR_LIMPEZA_TOTAL'
-CONFIRMAR_REINDEXACAO = 'CONFIRMAR_REINDEXACAO'
-
-
-class DeleteFileRequest(BaseModel):
-    # Requisição para exclusão seletiva de arquivo vetorial
-    original_file_id: str = Field(..., description="ID do arquivo original a ser excluído")
-    confirmation_phrase: Literal['CONFIRMAR_EXCLUSAO'] = Field(..., description="Frase de confirmação obrigatória")
-    reason: Optional[str] = Field(default=None, description="Motivo opcional da exclusão")
-    hard_delete: bool = Field(default=False, description="Se verdadeiro, realiza exclusão física")
-
-
-class CleanupRequest(BaseModel):
-    # Requisição para limpeza geral da base vetorial
-    confirmation_phrase: Literal['CONFIRMAR_LIMPEZA_TOTAL'] = Field(..., description="Frase de confirmação obrigatória")
-    reason: Optional[str] = Field(default=None, description="Motivo opcional da limpeza")
-    hard_delete: bool = Field(default=False, description="Se verdadeiro, realiza exclusão física")
-
-
-class ReindexRequest(BaseModel):
-    # Requisição para reindexação da base vetorial
-    confirmation_phrase: Literal['CONFIRMAR_REINDEXACAO'] = Field(..., description="Frase de confirmação obrigatória")
-    original_file_ids: Optional[List[str]] = Field(default=None, description="Lista opcional de IDs de arquivos para reindexar")
 
 
 class VectorFileSummary(BaseModel):
-    # Resumo de arquivo vetorial
+    """
+    Resumo de um arquivo vetorial, contendo informações básicas sobre o arquivo e seus chunks.
+    """
     original_file_id: str
-    original_file_name: Optional[str] = None
+    original_file_name: str
     storage_bucket: Optional[str] = None
     storage_path: Optional[str] = None
-    total_chunks: int = 0
-    active_chunks: int = 0
-    deleted_chunks: int = 0
-    deleted_at: Optional[str] = None
-    last_ingested_at: Optional[str] = None
-    status: str = 'unknown'
-
-
-class VectorFileDetail(VectorFileSummary):
-    # Detalhes completos de arquivo vetorial, herdando de VectorFileSummary
-    metadata: Optional[Dict[str, Any]] = None
-
-
-class VectorOperationResponse(BaseModel):
-    # Resposta para operações administrativas na base vetorial
-    message: str
+    total_chunks: int
+    active_chunks: int
+    deleted_chunks: int
+    deleted_at: Optional[datetime] = None
+    last_ingested_at: Optional[datetime] = None
     status: str
-    details: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
-class VectorFileListResponse(BaseModel):
-    # Resposta para listagem de arquivos vetoriais
-    files: List[VectorFileSummary] = Field(default_factory=list)
+class VectorFileDetail(BaseModel):
+    """
+    Detalhes completos de um arquivo vetorial, incluindo metadados e estatísticas de chunks.
+    """
+    original_file_id: str
+    original_file_name: str
+    storage_bucket: Optional[str] = None
+    storage_path: Optional[str] = None
+    total_chunks: int
+    active_chunks: int
+    deleted_chunks: int
+    deleted_at: Optional[datetime] = None
+    last_ingested_at: Optional[datetime] = None
+    status: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class DeleteFileRequest(BaseModel):
+    """
+    Solicitação para deletar um arquivo vetorial, com confirmação e opções.
+    """
+    confirmation_phrase: str
+    reason: Optional[str] = None
+    hard_delete: bool = True
+
+
+class DeleteFileResponse(BaseModel):
+    """
+    Resposta da operação de deletar um arquivo vetorial, com estatísticas da exclusão.
+    """
+    original_file_id: str
+    original_file_name: str
+    documents_deleted: int
+    ingestion_logs_deleted: int
+    storage_deleted: bool
+    storage_bucket: Optional[str] = None
+    storage_path: Optional[str] = None
+    status: str
+    message: str
+
+
+class CleanupVectorBaseRequest(BaseModel):
+    """
+    Solicitação para limpeza da base vetorial, com confirmação obrigatória.
+    """
+    confirmation_phrase: str
+
+
+class CleanupVectorBaseResponse(BaseModel):
+    """
+    Resposta da operação de limpeza da base vetorial, com estatísticas da limpeza.
+    """
+    total_files_processed: int
+    total_documents_deleted: int
+    total_ingestion_logs_deleted: int
+    total_storage_deleted: int
+    status: str
+    message: str
+
+
+class ReindexFileRequest(BaseModel):
+    """
+    Solicitação para reindexar arquivos vetoriais, com confirmação e lista opcional de IDs.
+    """
+    confirmation_phrase: str
+    original_file_ids: Optional[List[str]] = None
+
+
+class ReindexFileResponse(BaseModel):
+    """
+    Resposta da operação de reindexação de arquivos vetoriais, com estatísticas do processamento.
+    """
+    processed_files: int
+    failed_files: int
+    total_chunks_created: int
+    status: str
+    message: str
+
+
+class VectorChunk(BaseModel):
+    """
+    Representa um chunk vetorial, com conteúdo, metadados e informações do arquivo original.
+    """
+    id: Optional[str] = None
+    content: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    original_file_id: str
+    original_file_name: str
+    storage_bucket: Optional[str] = None
+    storage_path: Optional[str] = None
+    deleted_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    page: int = 0
+    chunk_index: int = 0
+
+
+class VectorChunksResponse(BaseModel):
+    """
+    Resposta contendo a lista de chunks vetoriais de um arquivo, com estatísticas.
+    """
+    original_file_id: str
+    original_file_name: str
+    total_chunks: int
+    active_chunks: int
+    deleted_chunks: int
+    chunks: List[VectorChunk]
+    status: str
+    message: str
+
+
+class RecoverFileContentResponse(BaseModel):
+    """
+    Resposta da recuperação de conteúdo de um arquivo vetorial, incluindo chunks e conteúdo reconstruído.
+    """
+    original_file_id: str
+    original_file_name: str
+    storage_bucket: Optional[str] = None
+    storage_path: Optional[str] = None
+    total_chunks: int
+    active_chunks: int
+    deleted_chunks: int
+    content: str
+    chunks: List[VectorChunk]
+    status: str
+    message: str
+
+
+class RecoveryDiagnosisResponse(BaseModel):
+    """
+    Resposta do diagnóstico de recuperação de um arquivo vetorial, indicando possibilidades de recuperação.
+    """
+    original_file_id: str
+    original_file_name: str
+    total_chunks: int
+    active_chunks: int
+    deleted_chunks: int
+    has_table_data: bool
+    has_storage: bool
+    recoverable_from_table: bool
+    recoverable_from_storage: bool
+    recoverable_from_both: bool
+    recoverable_from_none: bool
+    status: str
+    message: str

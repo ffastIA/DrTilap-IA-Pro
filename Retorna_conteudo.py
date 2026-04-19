@@ -227,7 +227,7 @@ if __name__ == "__main__":
         ),
         diretorios_excluir_adicional=(
             ".git", "__pycache__", ".vscode", ".idea",
-            "node_modules", "build", "dist"
+            "node_modules", "build", "dist",
         ),
         arquivos_excluir_adicional=()
     )

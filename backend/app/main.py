@@ -1,146 +1,274 @@
 # CAMINHO: backend/app/main.py
-# ARQUIVO: main.py
 
-import shutil
-import logging
 from pathlib import Path
-from typing import List
-from fastapi import FastAPI, HTTPException, status, UploadFile, File, Depends
+import logging
+import shutil
+from typing import Any, Dict, List, Tuple
+import uvicorn
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
-from fastapi.middleware.cors import CORSMiddleware
 from app.auth.auth_service import auth_service
+from app.database import supabase_auth, supabase_admin
 from app.services.rag_service import rag_service
-from app.dependencies import get_current_admin_user
-from app.vector_admin_schemas import DeleteFileRequest, CleanupRequest, ReindexRequest
 from app.services.vector_admin_service import vector_admin_service
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger('DrTilapiaAPI')
-app = FastAPI(title='Dr. Tilápia 2.0 API', version='2.1.0')
-
-# Configuração de CORS aberta
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+from app.vector_admin_schemas import (
+    VectorFileSummary,
+    VectorFileDetail,
+    DeleteFileRequest,
+    DeleteFileResponse,
+    CleanupVectorBaseRequest,
+    CleanupVectorBaseResponse,
+    ReindexFileRequest,
+    ReindexFileResponse,
+    VectorChunksResponse,
+    RecoverFileContentResponse,
+    RecoveryDiagnosisResponse,
 )
 
+# Configuração do logger
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Inicialização da aplicação FastAPI
+app = FastAPI(title="Dr. Tilápia API", version="2.2.0")
+
+# Diretório para uploads temporários
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+# Segurança para autenticação Bearer
+security = HTTPBearer()
+
+
 class LoginRequest(BaseModel):
+    """
+    Modelo para requisição de login.
+    """
     email: str
     password: str
 
+
 class ChatRequest(BaseModel):
+    """
+    Modelo para requisição de chat.
+    """
     message: str
-    history: List[List[str]] = []
+    history: List[List[str]]
 
-UPLOAD_DIR = Path('temp_uploads')
-UPLOAD_DIR.mkdir(exist_ok=True)
 
-@app.get('/health')
-async def health():
-    return {'status': 'online', 'version': app.version}
+def get_current_admin_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
+    """
+    Dependência para obter o usuário admin atual a partir do token Bearer.
 
-@app.post('/auth/login')
-async def login(data: LoginRequest):
-    result = await auth_service.login(data.email, data.password)
+    Args:
+        credentials: Credenciais de autorização HTTP.
+
+    Returns:
+        Dict[str, Any]: Dados do usuário admin (id, email, role).
+
+    Raises:
+        HTTPException: Se o token for inválido ou o usuário não for admin.
+    """
+    token = credentials.credentials
+    try:
+        user = supabase_auth.auth.get_user(token)
+        if not user or not user.user:
+            raise HTTPException(status_code=401, detail="Token inválido")
+        user_id = user.user.id
+        result = supabase_admin.table("users").select("id, email, role").eq("id", user_id).execute()
+        if not result.data or result.data[0]["role"] != "admin":
+            raise HTTPException(status_code=403, detail="Acesso negado: usuário não é admin")
+        return result.data[0]
+    except Exception as e:
+        logger.error(f"Erro ao validar usuário admin: {e}")
+        raise HTTPException(status_code=401, detail="Erro na autenticação")
+
+
+@app.get("/health")
+def health_check():
+    """
+    Endpoint para verificação de saúde da API.
+
+    Returns:
+        Dict[str, str]: Status da API.
+    """
+    return {"status": "ok"}
+
+
+@app.post("/auth/login")
+async def login(request: LoginRequest):
+    """
+    Endpoint para login de usuário.
+
+    Args:
+        request: Dados de login (email e senha).
+
+    Returns:
+        Dict: Resultado do login.
+
+    Raises:
+        HTTPException: Se as credenciais forem inválidas.
+    """
+    result = await auth_service.login(request.email, request.password)
     if not result:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='E-mail ou senha incorretos')
+        raise HTTPException(status_code=401, detail="Credenciais inválidas")
     return result
 
-@app.post('/admin/upload')
-async def upload_document(file: UploadFile = File(...), current_admin: dict = Depends(get_current_admin_user)):
-    if not file.filename or not file.filename.endswith('.pdf'):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Apenas arquivos PDF são permitidos.')
+
+@app.post("/consultoria/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """
+    Endpoint para upload de arquivos PDF para ingestão no RAG.
+
+    Args:
+        file: Arquivo PDF a ser enviado.
+
+    Returns:
+        Dict[str, str]: Mensagem de sucesso.
+
+    Raises:
+        HTTPException: Se o arquivo não for PDF.
+    """
+    if file.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="Apenas arquivos PDF são aceitos")
     temp_file = UPLOAD_DIR / file.filename
     try:
-        with open(temp_file, 'wb') as buffer:
+        with open(temp_file, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        result = await rag_service.ingest_pdf(str(temp_file), file.filename, current_admin.get('id'))
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f'Erro ao processar upload: {str(e)}')
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f'Erro ao processar upload: {str(e)}')
+        await rag_service.ingest_pdf(str(temp_file), file.filename)
+        logger.info(f"Arquivo {file.filename} processado com sucesso")
     finally:
         if temp_file.exists():
             temp_file.unlink()
+    return {"message": "Arquivo processado com sucesso"}
 
-@app.post('/consultoria/chat')
-async def chat(data: ChatRequest):
-    formatted_history = [tuple(h) for h in data.history]
-    try:
-        response = await rag_service.get_answer(data.message, formatted_history)
-        return response
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f'Erro interno: {str(e)}')
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f'Erro interno: {str(e)}')
 
-@app.get('/admin/vector-base/files')
-async def list_files(current_admin: dict = Depends(get_current_admin_user)):
+@app.post("/consultoria/chat")
+async def chat(request: ChatRequest):
+    """
+    Endpoint para interação de chat com o RAG.
+
+    Args:
+        request: Mensagem e histórico do chat.
+
+    Returns:
+        Dict[str, str]: Resposta do RAG.
+    """
+    formatted_history: List[Tuple[str, str]] = [tuple(item) for item in request.history]
+    answer = await rag_service.get_answer(request.message, formatted_history)
+    return {"answer": answer}
+
+
+@app.get("/admin/vector-base/files", response_model=List[VectorFileSummary], dependencies=[Depends(get_current_admin_user)])
+def list_files():
+    """
+    Endpoint para listar arquivos na base vetorial (apenas admin).
+
+    Returns:
+        List[VectorFileSummary]: Lista de resumos dos arquivos.
+    """
     return vector_admin_service.list_files()
 
-@app.get('/admin/vector-base/files/{original_file_id}')
-async def get_file_detail(original_file_id: str, current_admin: dict = Depends(get_current_admin_user)):
-    try:
-        return vector_admin_service.get_file_detail(original_file_id)
-    except ValueError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Arquivo não encontrado')
-    except Exception as e:
-        logger.error(f'Erro interno do servidor: {str(e)}')
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail='Erro interno do servidor')
 
-@app.post('/admin/vector-base/files/{original_file_id}/delete')
-async def delete_file(original_file_id: str, body: DeleteFileRequest, current_admin: dict = Depends(get_current_admin_user)):
-    if body.original_file_id != original_file_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='O original_file_id do corpo deve ser igual ao da URL.')
-    try:
-        result = vector_admin_service.delete_by_file(
-            original_file_id=original_file_id,
-            deleted_by=current_admin.get('id'),
-            hard_delete=body.hard_delete,
-            reason=body.reason,
-        )
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f'Erro interno do servidor: {str(e)}')
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail='Erro interno do servidor')
+@app.get("/admin/vector-base/files/{original_file_id}", response_model=VectorFileDetail, dependencies=[Depends(get_current_admin_user)])
+def get_file(original_file_id: str):
+    """
+    Endpoint para obter detalhes de um arquivo na base vetorial (apenas admin).
 
-@app.post('/admin/vector-base/cleanup')
-async def cleanup(body: CleanupRequest, current_admin: dict = Depends(get_current_admin_user)):
-    try:
-        result = vector_admin_service.cleanup_all(
-            deleted_by=current_admin.get('id'),
-            hard_delete=body.hard_delete,
-            reason=body.reason,
-        )
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f'Erro interno do servidor: {str(e)}')
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail='Erro interno do servidor')
+    Args:
+        original_file_id: ID do arquivo original.
 
-@app.post('/admin/vector-base/reindex')
-async def reindex(body: ReindexRequest, current_admin: dict = Depends(get_current_admin_user)):
-    try:
-        result = await vector_admin_service.reindex_files(
-            original_file_ids=body.original_file_ids,
-            requested_by=current_admin.get('id'),
-        )
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f'Erro interno do servidor: {str(e)}')
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail='Erro interno do servidor')
+    Returns:
+        VectorFileDetail: Detalhes do arquivo.
+    """
+    return vector_admin_service.get_file(original_file_id)
 
-if __name__ == '__main__':
-    import uvicorn
-    uvicorn.run(app, host='0.0.0.0', port=8000)
+
+@app.post("/admin/vector-base/files/{original_file_id}/delete", response_model=DeleteFileResponse, dependencies=[Depends(get_current_admin_user)])
+def delete_file(original_file_id: str, request: DeleteFileRequest):
+    """
+    Endpoint para deletar um arquivo da base vetorial (apenas admin).
+
+    Args:
+        original_file_id: ID do arquivo original.
+        request: Dados da requisição de deleção.
+
+    Returns:
+        DeleteFileResponse: Resposta da deleção.
+    """
+    return vector_admin_service.delete_file(original_file_id, request.confirmation_phrase, request.reason, request.hard_delete)
+
+
+@app.post("/admin/vector-base/cleanup", response_model=CleanupVectorBaseResponse, dependencies=[Depends(get_current_admin_user)])
+def cleanup_vector_base(request: CleanupVectorBaseRequest):
+    """
+    Endpoint para limpeza da base vetorial (apenas admin).
+
+    Args:
+        request: Dados da requisição de limpeza.
+
+    Returns:
+        CleanupVectorBaseResponse: Resposta da limpeza.
+    """
+    return vector_admin_service.cleanup_vector_base(request.confirmation_phrase)
+
+
+@app.post("/admin/vector-base/reindex", response_model=ReindexFileResponse, dependencies=[Depends(get_current_admin_user)])
+async def reindex_files(request: ReindexFileRequest):
+    """
+    Endpoint para reindexar arquivos na base vetorial (apenas admin).
+
+    Args:
+        request: Dados da requisição de reindexação.
+
+    Returns:
+        ReindexFileResponse: Resposta da reindexação.
+    """
+    return await vector_admin_service.reindex_files(request.confirmation_phrase, request.original_file_ids)
+
+
+@app.get("/admin/vector-base/files/{original_file_id}/chunks", response_model=VectorChunksResponse, dependencies=[Depends(get_current_admin_user)])
+def get_file_chunks(original_file_id: str):
+    """
+    Endpoint para obter chunks de um arquivo na base vetorial (apenas admin).
+
+    Args:
+        original_file_id: ID do arquivo original.
+
+    Returns:
+        VectorChunksResponse: Chunks do arquivo.
+    """
+    return vector_admin_service.get_file_chunks(original_file_id)
+
+
+@app.get("/admin/vector-base/files/{original_file_id}/content", response_model=RecoverFileContentResponse, dependencies=[Depends(get_current_admin_user)])
+def recover_file_content(original_file_id: str):
+    """
+    Endpoint para recuperar conteúdo de um arquivo na base vetorial (apenas admin).
+
+    Args:
+        original_file_id: ID do arquivo original.
+
+    Returns:
+        RecoverFileContentResponse: Conteúdo recuperado.
+    """
+    return vector_admin_service.recover_file_content(original_file_id)
+
+
+@app.get("/admin/vector-base/files/{original_file_id}/diagnosis", response_model=RecoveryDiagnosisResponse, dependencies=[Depends(get_current_admin_user)])
+def diagnose_file_recovery(original_file_id: str):
+    """
+    Endpoint para diagnóstico de recuperação de um arquivo na base vetorial (apenas admin).
+
+    Args:
+        original_file_id: ID do arquivo original.
+
+    Returns:
+        RecoveryDiagnosisResponse: Diagnóstico de recuperação.
+    """
+    return vector_admin_service.diagnose_file_recovery(original_file_id)
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
