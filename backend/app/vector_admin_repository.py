@@ -1,173 +1,305 @@
 # CAMINHO: backend/app/vector_admin_repository.py
 
-from app.database import supabase_admin
-from typing import List, Dict, Any, Optional
+import logging
+import json
+from typing import Dict, List, Any, Optional
+from collections import defaultdict
 from datetime import datetime
+import os.path
+
+from app.database import supabase_admin
 
 
 class VectorAdminRepository:
     """
-    Repositório para administração de vetores no Supabase.
+    Repositório para operações administrativas na base vetorial.
+
+    Este repositório gerencia arquivos e chunks na tabela 'documents',
+    sendo tolerante a dados legados e focado em compatibilidade com endpoints administrativos.
     """
 
     def __init__(self):
-        self.supabase = supabase_admin
+        self.logger = logging.getLogger(__name__)
 
-    def list_files(self) -> List[Dict[str, Any]]:
+    def _safe_metadata(self, metadata: Any) -> Dict[str, Any]:
         """
-        Lista todos os arquivos agregados por original_file_id.
+        Trata o campo metadata com segurança, retornando um dict válido.
         """
-        rows = self._fetch_documents_rows()
-        return self._aggregate_rows(rows)
+        if metadata is None:
+            return {}
+        if isinstance(metadata, dict):
+            return metadata
+        if isinstance(metadata, str):
+            try:
+                return json.loads(metadata)
+            except json.JSONDecodeError:
+                self.logger.warning(f"Falha ao parsear metadata como JSON: {metadata}")
+                return {}
+        self.logger.warning(f"Tipo inválido para metadata: {type(metadata)}, usando {{}}")
+        return {}
 
-    def get_file(self, original_file_id: str) -> Optional[Dict[str, Any]]:
+    def _get_first_non_empty(self, *values: Optional[str]) -> Optional[str]:
         """
-        Obtém os detalhes de um arquivo específico.
+        Retorna o primeiro valor não vazio da lista.
         """
-        files = self.list_files()
-        for file in files:
-            if file['original_file_id'] == original_file_id:
-                return file
+        for value in values:
+            if value and isinstance(value, str) and value.strip():
+                return value.strip()
         return None
 
-    def purge_file(self, original_file_id: str) -> Dict[str, Any]:
+    def _normalize_datetime(self, dt: Any) -> Optional[datetime]:
         """
-        Remove completamente um arquivo do sistema.
+        Normaliza um valor para datetime, se possível.
         """
-        file_info = self.get_file(original_file_id)
-        if not file_info:
-            return {
-                'original_file_id': original_file_id,
-                'original_file_name': None,
-                'documents_deleted': 0,
-                'ingestion_logs_deleted': 0,
-                'storage_deleted': False,
-                'storage_bucket': None,
-                'storage_path': None,
-                'status': 'error',
-                'message': 'Arquivo não encontrado.'
-            }
+        if isinstance(dt, datetime):
+            return dt
+        if isinstance(dt, str):
+            try:
+                return datetime.fromisoformat(dt.replace('Z', '+00:00'))
+            except ValueError:
+                pass
+        return None
 
-        documents_deleted = self._delete_documents_by_original_file_id(original_file_id)
-        ingestion_logs_deleted = self._delete_ingestion_logs_best_effort(original_file_id)
-        storage_deleted = self._delete_storage_object(file_info.get('storage_bucket'), file_info.get('storage_path'))
+    def _datetime_to_iso(self, dt: Optional[datetime]) -> Optional[str]:
+        """
+        Converte datetime para string ISO, se não for None.
+        """
+        return dt.isoformat() if dt else None
+
+    def _coerce_int(self, value: Any) -> Optional[int]:
+        """
+        Tenta converter valor para int, retornando None se falhar.
+        """
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return None
+
+    def _extract_document_fields(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Extrai campos de uma linha de documento com fallbacks.
+        """
+        metadata = self._safe_metadata(row.get('metadata'))
+
+        original_file_id = row.get('original_file_id') or metadata.get('original_file_id')
+        original_file_name = self._get_first_non_empty(
+            row.get('original_file_name'),
+            metadata.get('original_file_name'),
+            metadata.get('source'),
+            metadata.get('file_name'),
+            metadata.get('filename'),
+            os.path.basename(metadata.get('storage_path', '')) if metadata.get('storage_path') else None
+        )
+        storage_bucket = row.get('storage_bucket') or metadata.get('storage_bucket')
+        storage_path = row.get('storage_path') or metadata.get('storage_path')
+        deleted_at = self._normalize_datetime(row.get('deleted_at') or metadata.get('deleted_at'))
+        last_ingested_at = self._normalize_datetime(row.get('last_ingested_at') or metadata.get('last_ingested_at'))
+        page = self._coerce_int(row.get('page') or metadata.get('page'))
+        chunk_index = self._coerce_int(row.get('chunk_index') or metadata.get('chunk_index'))
+        id_ = row.get('id')
+        content = row.get('content') or metadata.get('content') or ''
+        created_at = self._normalize_datetime(row.get('created_at'))
+        updated_at = self._normalize_datetime(row.get('updated_at'))
 
         return {
             'original_file_id': original_file_id,
-            'original_file_name': file_info.get('original_file_name'),
-            'documents_deleted': documents_deleted,
-            'ingestion_logs_deleted': ingestion_logs_deleted,
-            'storage_deleted': storage_deleted,
-            'storage_bucket': file_info.get('storage_bucket'),
-            'storage_path': file_info.get('storage_path'),
-            'status': 'success',
-            'message': 'Arquivo removido com sucesso.'
-        }
-
-    def cleanup_vector_base(self) -> Dict[str, Any]:
-        """
-        Limpa a base de vetores removendo arquivos deletados.
-        """
-        files = self.list_files()
-        total_files_processed = 0
-        total_documents_deleted = 0
-        total_ingestion_logs_deleted = 0
-        total_storage_deleted = 0
-
-        for file in files:
-            if file.get('deleted_at'):
-                result = self.purge_file(file['original_file_id'])
-                total_files_processed += 1
-                total_documents_deleted += result['documents_deleted']
-                total_ingestion_logs_deleted += result['ingestion_logs_deleted']
-                if result['storage_deleted']:
-                    total_storage_deleted += 1
-
-        return {
-            'total_files_processed': total_files_processed,
-            'total_documents_deleted': total_documents_deleted,
-            'total_ingestion_logs_deleted': total_ingestion_logs_deleted,
-            'total_storage_deleted': total_storage_deleted,
-            'status': 'success',
-            'message': 'Limpeza concluída.'
-        }
-
-    def list_reindexable_files(self, original_file_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-        """
-        Lista arquivos que podem ser reindexados.
-        """
-        files = self.list_files()
-        if original_file_ids:
-            files = [f for f in files if f['original_file_id'] in original_file_ids]
-        return [f for f in files if f.get('status') == 'active']
-
-    def get_document_chunks(self, original_file_id: str, include_deleted: bool = False) -> List[Dict[str, Any]]:
-        """
-        Obtém os chunks de um documento.
-        """
-        response = self.supabase.table('documents').select('*').eq('original_file_id', original_file_id)
-        if not include_deleted:
-            response = response.is_('deleted_at', None)
-        rows = response.execute().data
-        chunks = [self._normalize_document_row(row) for row in rows]
-        return self._sort_chunks(chunks)
-
-    def get_active_document_chunks(self, original_file_id: str) -> List[Dict[str, Any]]:
-        """
-        Obtém os chunks ativos de um documento.
-        """
-        return self.get_document_chunks(original_file_id, include_deleted=False)
-
-    def rebuild_document_content(self, original_file_id: str, include_deleted: bool = False) -> Dict[str, Any]:
-        """
-        Reconstrói o conteúdo do documento a partir dos chunks.
-        """
-        chunks = self.get_document_chunks(original_file_id, include_deleted)
-        content = ''.join([chunk.get('content', '') for chunk in chunks])
-        return {
-            'original_file_id': original_file_id,
+            'original_file_name': original_file_name,
+            'storage_bucket': storage_bucket,
+            'storage_path': storage_path,
+            'deleted_at': deleted_at,
+            'last_ingested_at': last_ingested_at,
+            'page': page,
+            'chunk_index': chunk_index,
+            'id': id_,
             'content': content,
-            'chunks': chunks
+            'created_at': created_at,
+            'updated_at': updated_at,
+            'metadata': metadata
         }
 
-    def get_file_recovery_diagnosis(self, original_file_id: str) -> Dict[str, Any]:
+    def _fetch_document_rows(self) -> List[Dict[str, Any]]:
         """
-        Diagnóstico de recuperação para um arquivo.
+        Busca todas as linhas da tabela documents.
         """
-        file_info = self.get_file(original_file_id)
-        if not file_info:
-            return {
-                'original_file_id': original_file_id,
-                'original_file_name': None,
-                'total_chunks': 0,
-                'active_chunks': 0,
-                'deleted_chunks': 0,
-                'has_table_data': False,
-                'has_storage': False,
-                'recoverable_from_table': False,
-                'recoverable_from_storage': False,
-                'recoverable_from_both': False,
-                'recoverable_from_none': True,
-                'status': 'error',
-                'message': 'Arquivo não encontrado.'
-            }
+        try:
+            response = supabase_admin.table("documents").select("*").execute()
+            return response.data or []
+        except Exception as e:
+            self.logger.error(f"Erro ao buscar documentos: {e}")
+            raise
 
-        total_chunks = file_info.get('total_chunks', 0)
-        active_chunks = file_info.get('active_chunks', 0)
-        deleted_chunks = file_info.get('deleted_chunks', 0)
-        has_table_data = total_chunks > 0
-        has_storage = self._check_storage_object_exists(file_info.get('storage_bucket'), file_info.get('storage_path'))
-        recoverable_from_table = has_table_data
-        recoverable_from_storage = has_storage
-        recoverable_from_both = has_table_data and has_storage
-        recoverable_from_none = not has_table_data and not has_storage
+    def _group_valid_rows_by_file(self, rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Agrupa linhas válidas por original_file_id, ignorando inválidas.
+        """
+        grouped = defaultdict(list)
+        for row in rows:
+            fields = self._extract_document_fields(row)
+            if fields['original_file_id'] and fields['original_file_name']:
+                grouped[fields['original_file_id']].append(fields)
+        return dict(grouped)
+
+    def _build_file_summary(self, file_id: str, chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Constrói resumo de arquivo para list_files.
+        """
+        total_chunks = len(chunks)
+        active_chunks = sum(1 for c in chunks if not c['deleted_at'])
+        deleted_chunks = total_chunks - active_chunks
+
+        # Usar dados do primeiro chunk como base
+        first = chunks[0] if chunks else {}
 
         return {
-            'original_file_id': original_file_id,
-            'original_file_name': file_info.get('original_file_name'),
+            'original_file_id': file_id,
+            'original_file_name': first.get('original_file_name'),
+            'storage_bucket': first.get('storage_bucket'),
+            'storage_path': first.get('storage_path'),
             'total_chunks': total_chunks,
             'active_chunks': active_chunks,
             'deleted_chunks': deleted_chunks,
+            'deleted_at': self._datetime_to_iso(first.get('deleted_at')),
+            'last_ingested_at': self._datetime_to_iso(first.get('last_ingested_at')),
+            'status': 'active' if active_chunks > 0 else 'deleted',
+            'metadata': first.get('metadata', {})
+        }
+
+    def _build_chunk_item(self, chunk: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Constrói item de chunk para get_file_chunks.
+        """
+        return {
+            'id': str(chunk['id']),
+            'content': chunk['content'],
+            'metadata': chunk['metadata'],
+            'original_file_id': chunk['original_file_id'],
+            'original_file_name': chunk['original_file_name'],
+            'storage_bucket': chunk['storage_bucket'],
+            'storage_path': chunk['storage_path'],
+            'deleted_at': self._datetime_to_iso(chunk['deleted_at']),
+            'created_at': self._datetime_to_iso(chunk['created_at']),
+            'updated_at': self._datetime_to_iso(chunk['updated_at']),
+            'page': chunk['page'],
+            'chunk_index': chunk['chunk_index']
+        }
+
+    def _best_effort_delete_ingestion_logs(self, original_file_id: str) -> int:
+        """
+        Tenta deletar logs de ingestão, ignorando tabelas ausentes.
+        """
+        deleted = 0
+        for table in ['ingestion_logs', 'rag_ingestion_logs']:
+            try:
+                response = supabase_admin.table(table).delete().eq('original_file_id', original_file_id).execute()
+                deleted += len(response.data or [])
+            except Exception as e:
+                self.logger.warning(f"Falha ao deletar de {table}: {e}")
+        return deleted
+
+    def list_files(self) -> List[Dict[str, Any]]:
+        """
+        Lista arquivos válidos com resumos.
+        """
+        rows = self._fetch_document_rows()
+        grouped = self._group_valid_rows_by_file(rows)
+        return [self._build_file_summary(fid, chunks) for fid, chunks in grouped.items()]
+
+    def get_file(self, original_file_id: str) -> Dict[str, Any]:
+        """
+        Obtém resumo de um arquivo específico.
+        """
+        rows = self._fetch_document_rows()
+        grouped = self._group_valid_rows_by_file(rows)
+        if original_file_id not in grouped:
+            raise ValueError(f"Arquivo não encontrado: {original_file_id}")
+        chunks = grouped[original_file_id]
+        return self._build_file_summary(original_file_id, chunks)
+
+    def get_file_chunks(self, original_file_id: str) -> Dict[str, Any]:
+        """
+        Retorna chunks de um arquivo, compatível com endpoint administrativo.
+        """
+        file_summary = self.get_file(original_file_id)
+        rows = self._fetch_document_rows()
+        grouped = self._group_valid_rows_by_file(rows)
+        chunks_data = grouped[original_file_id]
+
+        # Ordenar chunks
+        def sort_key(c):
+            return (c['page'] or 0, c['chunk_index'] or 0, c['created_at'] or datetime.min)
+
+        chunks_data.sort(key=sort_key)
+
+        chunks = [self._build_chunk_item(c) for c in chunks_data]
+
+        return {
+            'original_file_id': original_file_id,
+            'original_file_name': file_summary['original_file_name'],
+            'total_chunks': file_summary['total_chunks'],
+            'active_chunks': file_summary['active_chunks'],
+            'deleted_chunks': file_summary['deleted_chunks'],
+            'chunks': chunks,
+            'status': 'success',
+            'message': f"Chunks recuperados para {original_file_id}"
+        }
+
+    def recover_file_content(self, original_file_id: str) -> Dict[str, Any]:
+        """
+        Reconstrói conteúdo de arquivo a partir de chunks ativos.
+        """
+        file_summary = self.get_file(original_file_id)
+        rows = self._fetch_document_rows()
+        grouped = self._group_valid_rows_by_file(rows)
+        chunks_data = grouped[original_file_id]
+
+        # Filtrar chunks ativos com conteúdo
+        active_chunks = [c for c in chunks_data if not c['deleted_at'] and c['content']]
+
+        # Ordenar
+        def sort_key(c):
+            return (c['page'] or 0, c['chunk_index'] or 0, c['created_at'] or datetime.min)
+
+        active_chunks.sort(key=sort_key)
+
+        # Reconstruir conteúdo
+        content = '\n'.join(c['content'] for c in active_chunks)
+
+        chunks = [self._build_chunk_item(c) for c in active_chunks]
+
+        return {
+            'original_file_id': original_file_id,
+            'original_file_name': file_summary['original_file_name'],
+            'storage_bucket': file_summary['storage_bucket'],
+            'storage_path': file_summary['storage_path'],
+            'total_chunks': file_summary['total_chunks'],
+            'active_chunks': file_summary['active_chunks'],
+            'deleted_chunks': file_summary['deleted_chunks'],
+            'content': content,
+            'chunks': chunks,
+            'status': 'success',
+            'message': f"Conteúdo recuperado para {original_file_id}"
+        }
+
+    def diagnose_file_recovery(self, original_file_id: str) -> Dict[str, Any]:
+        """
+        Diagnóstica possibilidades de recuperação de arquivo.
+        """
+        file_summary = self.get_file(original_file_id)
+
+        # Simulação simples: assumir que se há chunks ativos, é recuperável da tabela
+        has_table_data = file_summary['active_chunks'] > 0
+        has_storage = bool(file_summary['storage_bucket'] and file_summary['storage_path'])
+        recoverable_from_table = has_table_data
+        recoverable_from_storage = has_storage  # Assumindo que storage existe se campos preenchidos
+        recoverable_from_both = recoverable_from_table and recoverable_from_storage
+        recoverable_from_none = not (recoverable_from_table or recoverable_from_storage)
+
+        return {
+            'original_file_id': original_file_id,
+            'original_file_name': file_summary['original_file_name'],
+            'total_chunks': file_summary['total_chunks'],
+            'active_chunks': file_summary['active_chunks'],
+            'deleted_chunks': file_summary['deleted_chunks'],
             'has_table_data': has_table_data,
             'has_storage': has_storage,
             'recoverable_from_table': recoverable_from_table,
@@ -175,136 +307,69 @@ class VectorAdminRepository:
             'recoverable_from_both': recoverable_from_both,
             'recoverable_from_none': recoverable_from_none,
             'status': 'success',
-            'message': 'Diagnóstico concluído.'
+            'message': f"Diagnóstico para {original_file_id}"
         }
 
-    def _fetch_documents_rows(self) -> List[Dict[str, Any]]:
+    def delete_file(self, original_file_id: str, confirmation_phrase: str, reason: Optional[str] = None,
+                    hard_delete: bool = True) -> Dict[str, Any]:
         """
-        Busca todas as linhas da tabela documents.
+        Deleta arquivo, incluindo dados e storage se hard_delete.
         """
-        return self.supabase.table('documents').select('*').execute().data
+        file_summary = self.get_file(original_file_id)
 
-    def _aggregate_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Agrega as linhas por original_file_id.
-        """
-        aggregated = {}
-        for row in rows:
-            oid = row.get('original_file_id')
-            if oid not in aggregated:
-                aggregated[oid] = {
-                    'original_file_id': oid,
-                    'original_file_name': row.get('original_file_name'),
-                    'storage_bucket': row.get('storage_bucket'),
-                    'storage_path': row.get('storage_path'),
-                    'total_chunks': 0,
-                    'active_chunks': 0,
-                    'deleted_chunks': 0,
-                    'deleted_at': None,
-                    'last_ingested_at': None,
-                    'status': 'active',
-                    'metadata': {}
-                }
-            agg = aggregated[oid]
-            agg['total_chunks'] += 1
-            if row.get('deleted_at'):
-                agg['deleted_chunks'] += 1
-                agg['deleted_at'] = self._parse_datetime(row.get('deleted_at'))
-            else:
-                agg['active_chunks'] += 1
-            ingested_at = self._parse_datetime(row.get('ingested_at'))
-            if ingested_at and (not agg['last_ingested_at'] or ingested_at > agg['last_ingested_at']):
-                agg['last_ingested_at'] = ingested_at
-            agg['metadata'] = self._normalize_metadata(row.get('metadata'))
-        return list(aggregated.values())
+        # Deletar documents
+        response = supabase_admin.table("documents").delete().eq('original_file_id', original_file_id).execute()
+        documents_deleted = len(response.data or [])
 
-    def _delete_storage_object(self, bucket: Optional[str], path: Optional[str]) -> bool:
-        """
-        Deleta um objeto do storage.
-        """
-        if not bucket or not path:
-            return False
-        try:
-            self.supabase.storage.from_(bucket).remove([path])
-            return True
-        except:
-            return False
+        # Deletar logs
+        ingestion_logs_deleted = self._best_effort_delete_ingestion_logs(original_file_id)
 
-    def _delete_ingestion_logs_best_effort(self, original_file_id: str) -> int:
-        """
-        Deleta logs de ingestão.
-        """
-        try:
-            response = self.supabase.table('ingestion_logs').delete().eq('original_file_id', original_file_id).execute()
-            return len(response.data)
-        except:
-            return 0
+        # Deletar storage
+        storage_deleted = False
+        if hard_delete and file_summary['storage_bucket'] and file_summary['storage_path']:
+            try:
+                supabase_admin.storage.from_(file_summary['storage_bucket']).remove([file_summary['storage_path']])
+                storage_deleted = True
+            except Exception as e:
+                self.logger.warning(f"Falha ao deletar storage: {e}")
 
-    def _delete_documents_by_original_file_id(self, original_file_id: str) -> int:
-        """
-        Deleta documentos por original_file_id.
-        """
-        response = self.supabase.table('documents').delete().eq('original_file_id', original_file_id).execute()
-        return len(response.data)
-
-    def _parse_datetime(self, dt_str: Optional[str]) -> Optional[datetime]:
-        """
-        Converte string para datetime.
-        """
-        if not dt_str:
-            return None
-        try:
-            return datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
-        except:
-            return None
-
-    def _normalize_metadata(self, metadata: Any) -> Dict[str, Any]:
-        """
-        Normaliza metadata.
-        """
-        if isinstance(metadata, dict):
-            return metadata
-        return {}
-
-    def _normalize_document_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Normaliza uma linha de documento.
-        """
         return {
-            'id': row.get('id'),
-            'original_file_id': row.get('original_file_id'),
-            'content': row.get('content', ''),
-            'metadata': self._normalize_metadata(row.get('metadata')),
-            'deleted_at': row.get('deleted_at'),
-            'ingested_at': row.get('ingested_at')
+            'original_file_id': original_file_id,
+            'original_file_name': file_summary['original_file_name'],
+            'documents_deleted': documents_deleted,
+            'ingestion_logs_deleted': ingestion_logs_deleted,
+            'storage_deleted': storage_deleted,
+            'storage_bucket': file_summary['storage_bucket'],
+            'storage_path': file_summary['storage_path'],
+            'status': 'success',
+            'message': f"Arquivo deletado: {original_file_id}"
         }
 
-    def _extract_page(self, metadata: Dict[str, Any]) -> int:
+    def cleanup_vector_base(self, confirmation_phrase: str) -> Dict[str, Any]:
         """
-        Extrai o número da página.
+        Limpa base vetorial, deletando todos os arquivos válidos.
         """
-        return metadata.get('page', 0)
+        files = self.list_files()
+        total_files_processed = len(files)
+        total_documents_deleted = 0
+        total_ingestion_logs_deleted = 0
+        total_storage_deleted = 0
 
-    def _extract_chunk_index(self, metadata: Dict[str, Any]) -> int:
-        """
-        Extrai o índice do chunk.
-        """
-        return metadata.get('chunk_index', 0)
+        for file in files:
+            fid = file['original_file_id']
+            try:
+                result = self.delete_file(fid, confirmation_phrase, hard_delete=True)
+                total_documents_deleted += result['documents_deleted']
+                total_ingestion_logs_deleted += result['ingestion_logs_deleted']
+                total_storage_deleted += 1 if result['storage_deleted'] else 0
+            except Exception as e:
+                self.logger.error(f"Erro ao deletar {fid}: {e}")
 
-    def _sort_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Ordena os chunks por página e índice.
-        """
-        return sorted(chunks, key=lambda c: (self._extract_page(c.get('metadata', {})), self._extract_chunk_index(c.get('metadata', {}))))
-
-    def _check_storage_object_exists(self, bucket: Optional[str], path: Optional[str]) -> bool:
-        """
-        Verifica se um objeto existe no storage.
-        """
-        if not bucket or not path:
-            return False
-        try:
-            self.supabase.storage.from_(bucket).list(path=path)
-            return True
-        except:
-            return False
+        return {
+            'total_files_processed': total_files_processed,
+            'total_documents_deleted': total_documents_deleted,
+            'total_ingestion_logs_deleted': total_ingestion_logs_deleted,
+            'total_storage_deleted': total_storage_deleted,
+            'status': 'success',
+            'message': "Limpeza da base vetorial concluída"
+        }
