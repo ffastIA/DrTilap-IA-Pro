@@ -1,5 +1,5 @@
-// components/AuthProvider.tsx
 'use client';
+// CAMINHO: frontend/components/AuthProvider.tsx
 
 import React, { useEffect } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
@@ -11,33 +11,30 @@ interface AuthProviderProps {
 }
 
 const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
-  const { isAuthenticated, isLoading } = useAuth();
+  const { isAuthenticated, isLoading, restoreAuth } = useAuth();
   const router = useRouter();
   const pathname = usePathname();
 
-  const publicRoutes = ['/', '/auth/login'];
-  const protectedRoutes = ['/main'];
+  useEffect(() => {
+    restoreAuth();
+  }, [restoreAuth]);
 
   useEffect(() => {
-    // Se ainda está carregando, não faz nada
-    if (isLoading) {
-      return;
-    }
+    if (isLoading) return;
 
-    const isPublicRoute = publicRoutes.includes(pathname);
+    const publicRoutes = ['/', '/auth/login'];
+    const protectedRoutes = ['/main'];
     const isProtectedRoute = protectedRoutes.some(route => pathname.startsWith(route));
 
-    // Se não autenticado e tenta acessar rota protegida, vai para login
     if (!isAuthenticated && isProtectedRoute) {
       router.push('/auth/login');
     }
-    // Se autenticado e tenta acessar login, vai para hub
-    else if (isAuthenticated && pathname === '/auth/login') {
+
+    if (isAuthenticated && pathname === '/auth/login') {
       router.push('/main/hub');
     }
   }, [isAuthenticated, isLoading, pathname, router]);
 
-  // Se ainda carregando, mostra spinner
   if (isLoading) {
     return (
       <div className="flex items-center justify-center min-h-screen bg-background">

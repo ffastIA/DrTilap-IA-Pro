@@ -1,4 +1,5 @@
 ﻿'use client';
+// CAMINHO: frontend/app/auth/login/page.tsx
 
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
@@ -10,13 +11,11 @@ export default function LoginPage() {
   const router = useRouter();
   const { isAuthenticated } = useAuth();
   const loginMutation = useLoginMutation();
-
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [validationError, setValidationError] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  // Se já está autenticado, redireciona para hub
   useEffect(() => {
     if (isAuthenticated) {
       router.push('/main/hub');
@@ -28,7 +27,6 @@ export default function LoginPage() {
     setValidationError('');
     setIsSubmitting(true);
 
-    // Validação local
     if (!email.trim()) {
       setValidationError('Email é obrigatório');
       setIsSubmitting(false);
@@ -53,9 +51,13 @@ export default function LoginPage() {
       return;
     }
 
-    // Enviar para autenticação
-    loginMutation.mutate({ email, password });
-    setIsSubmitting(false);
+    try {
+      await loginMutation.mutate({ email, password });
+    } catch {
+      // O hook já normaliza e expõe o erro
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   const handleInputChange = () => {
@@ -64,9 +66,7 @@ export default function LoginPage() {
 
   return (
     <div className="w-full max-w-md">
-      {/* Card Container com Glassmorphism */}
       <div className="glass p-8 space-y-6 backdrop-blur-md">
-        {/* Header */}
         <div className="text-center">
           <h1 className="text-4xl font-bold text-white mb-2">
             🐟 Dr. Tilápia
@@ -76,9 +76,7 @@ export default function LoginPage() {
           </p>
         </div>
 
-        {/* Form */}
         <form onSubmit={handleSubmit} className="space-y-4">
-          {/* Email Input */}
           <div>
             <label htmlFor="email" className="block text-sm font-medium text-slate-200 mb-2">
               Email
@@ -97,7 +95,6 @@ export default function LoginPage() {
             />
           </div>
 
-          {/* Password Input */}
           <div>
             <label htmlFor="password" className="block text-sm font-medium text-slate-200 mb-2">
               Senha
@@ -116,7 +113,6 @@ export default function LoginPage() {
             />
           </div>
 
-          {/* Validation Error Message */}
           {validationError && (
             <div className="p-4 bg-red-500/20 border border-red-500/50 rounded-lg animate-pulse">
               <p className="text-red-200 text-sm font-medium">
@@ -125,19 +121,15 @@ export default function LoginPage() {
             </div>
           )}
 
-          {/* API Error Message */}
           {loginMutation.isError && (
             <div className="p-4 bg-red-500/20 border border-red-500/50 rounded-lg">
               <p className="text-red-200 text-sm font-medium">
                 ❌{' '}
-                {loginMutation.error instanceof Error
-                  ? loginMutation.error.message
-                  : 'Erro ao fazer login. Verifique suas credenciais.'}
+                {loginMutation.error?.message || 'Erro ao fazer login. Verifique suas credenciais.'}
               </p>
             </div>
           )}
 
-          {/* Success Message (Temporary) */}
           {loginMutation.isSuccess && (
             <div className="p-4 bg-green-500/20 border border-green-500/50 rounded-lg">
               <p className="text-green-200 text-sm font-medium">
@@ -146,7 +138,6 @@ export default function LoginPage() {
             </div>
           )}
 
-          {/* Submit Button */}
           <button
             type="submit"
             disabled={loginMutation.isPending || isSubmitting}
@@ -182,7 +173,6 @@ export default function LoginPage() {
           </button>
         </form>
 
-        {/* Divider */}
         <div className="relative">
           <div className="absolute inset-0 flex items-center">
             <div className="w-full border-t border-slate-600/50" />
@@ -192,7 +182,6 @@ export default function LoginPage() {
           </div>
         </div>
 
-        {/* Test Credentials */}
         <div className="bg-slate-700/30 border border-slate-600/50 rounded-lg p-4">
           <p className="text-xs text-slate-400 mb-2 font-medium">📝 Credenciais de Teste:</p>
           <div className="space-y-1 text-xs text-slate-300">
@@ -209,7 +198,6 @@ export default function LoginPage() {
           </div>
         </div>
 
-        {/* Footer */}
         <div className="text-center text-sm text-slate-400 space-y-2">
           <p>Ou retorne para a página inicial</p>
           <Link
@@ -220,7 +208,6 @@ export default function LoginPage() {
           </Link>
         </div>
 
-        {/* Info */}
         <div className="pt-4 border-t border-slate-600/30">
           <p className="text-xs text-slate-500 text-center leading-relaxed">
             Este é um sistema seguro de consultoria IA. Seus dados são criptografados

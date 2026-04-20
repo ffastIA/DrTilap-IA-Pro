@@ -1,4 +1,4 @@
-// hooks/useLoginMutation.ts
+// CAMINHO: frontend/hooks/useLoginMutation.ts
 import { useState } from 'react';
 import { useAuthStore } from '@/store/authStore';
 import api from '@/lib/api';
@@ -16,33 +16,69 @@ interface User {
 
 interface LoginResponse {
   access_token: string;
-  token_type: string;
-  user: User;
+  token_type?: string;
+  user?: User;
+}
+
+function normalizeErrorMessage(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => {
+        if (typeof item === 'object' && item && 'msg' in item && typeof item.msg === 'string') {
+          return item.msg;
+        }
+        return JSON.stringify(item);
+      })
+      .join('; ');
+  }
+  if (typeof value === 'object' && value !== null) {
+    if ('msg' in value && typeof value.msg === 'string') {
+      return value.msg;
+    }
+    if ('detail' in value) {
+      return normalizeErrorMessage((value as any).detail);
+    }
+  }
+  return 'Erro ao fazer login. Verifique suas credenciais.';
 }
 
 export const useLoginMutation = () => {
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [isPending, setIsPending] = useState(false);
+  const [isError, setIsError] = useState(false);
+  const [isSuccess, setIsSuccess] = useState(false);
+  const [error, setError] = useState<Error | null>(null);
   const [data, setData] = useState<LoginResponse | null>(null);
-  const setAuth = useAuthStore((state) => state.setAuth);
+
+  const { setAuth } = useAuthStore();
 
   const mutate = async (credentials: LoginRequest) => {
-    setIsLoading(true);
+    setIsPending(true);
+    setIsError(false);
+    setIsSuccess(false);
     setError(null);
     setData(null);
+
     try {
       const response = await api.post<LoginResponse>('/auth/login', credentials);
-      setAuth(response.data.access_token, response.data.user);
+      let user = response.data.user;
+      if (!user) {
+        user = { id: '', email: credentials.email, role: 'user' };
+      }
+      setAuth(response.data.access_token, user);
       setData(response.data);
-      return response.data;
+      setIsSuccess(true);
     } catch (err: any) {
-      const errorMessage = err.response?.data?.detail || 'Erro ao fazer login. Verifique suas credenciais.';
-      setError(errorMessage);
-      throw new Error(errorMessage);
+      const normalizedError = new Error(normalizeErrorMessage(err.response?.data ?? err));
+      setError(normalizedError);
+      setIsError(true);
+      throw normalizedError;
     } finally {
-      setIsLoading(false);
+      setIsPending(false);
     }
   };
 
-  return { mutate, isLoading, error, data };
+  return { mutate, isPending, isError, isSuccess, error, data };
 };

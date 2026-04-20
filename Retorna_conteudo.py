@@ -219,7 +219,7 @@ def gerar_relatorio_pdf(
 if __name__ == "__main__":
     gerar_relatorio_pdf(
         diretorio_raiz=r"C:\Users\usuario\Python\DrTilapIA",
-        arquivo_saida=r"C:\Users\usuario\Python\DrTilapIA\Codigo.pdf",
+        arquivo_saida=r"C:\Users\usuario\Python\DrTilapIA\Codigo190426.pdf",
         extensoes_filtro=(
             ".py", ".txt", ".md", ".json", ".xml",
             ".html", ".css", ".js", ".mjs", ".ts",

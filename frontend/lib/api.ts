@@ -1,3 +1,5 @@
+// CAMINHO: frontend/lib/api.ts
+
 import axios from 'axios';
 import { useAuthStore } from '@/store/authStore';
 
@@ -10,10 +12,12 @@ const api = axios.create({
   },
 });
 
+// Request interceptor
 api.interceptors.request.use(
   (config) => {
     const token = useAuthStore.getState().token;
     if (token) {
+      config.headers = config.headers || {};
       config.headers.Authorization = `Bearer ${token}`;
     }
     return config;
@@ -23,12 +27,14 @@ api.interceptors.request.use(
   }
 );
 
+// Response interceptor
 api.interceptors.response.use(
-  (response) => response,
+  (response) => {
+    return response;
+  },
   (error) => {
-    if (error.response && error.response.status === 401 && !error.config.url?.includes('/auth/login')) {
-      console.error('Token expirado ou inválido. Realizando logout...');
-      useAuthStore.getState().logout();
+    if (error.response?.status === 401 && !error.config.url.includes('/auth/login')) {
+      useAuthStore.getState().clearAuth();
     }
     return Promise.reject(error);
   }
