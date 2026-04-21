@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from app.database import supabase_admin
 from app.services.vector_admin_service import vector_admin_service
+from app.services.rag_service import rag_service
 from app.vector_admin_schemas import (
     VectorFileSummary,
     VectorFileDetail,
@@ -34,6 +35,10 @@ class LoginResponse(BaseModel):
     access_token: str
     token_type: str
     user: LoginUserResponse
+
+class ChatRequest(BaseModel):
+    message: str
+    history: List[List[str]] = []
 
 # Helpers para login
 def _normalize_role(value: Any) -> str:
@@ -119,7 +124,16 @@ async def login(request: LoginRequest):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
 # Endpoints de chat (preservados)
-# ... (lógica existente de chat)
+@app.post("/consultoria/chat")
+async def chat(data: ChatRequest):
+    formatted_history = [tuple(h) for h in data.history]
+    try:
+        response = await rag_service.get_answer(data.message, formatted_history)
+        return response
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
 
 # Endpoints de upload (preservados)
 # ... (lógica existente de upload)
