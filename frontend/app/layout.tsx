@@ -1,4 +1,5 @@
-// app/layout.tsx
+// CAMINHO: frontend/app/layout.tsx
+
 import type { Metadata } from 'next';
 import { poppins } from '@/lib/fonts';
 import '@/styles/globals.css';
