@@ -1,9 +1,11 @@
+// CAMINHO: frontend/app/main/hub/page.tsx
 'use client';
 
 import React from 'react';
 import Link from 'next/link';
 import { MessageSquareTextIcon, UploadCloudIcon, BarChart2Icon, UserIcon } from 'lucide-react';
 import { useAuthStore } from '@/store/authStore';
+import { useRouter } from 'next/navigation';
 
 const FeatureCard: React.FC<{
   icon: React.ElementType;
@@ -23,10 +25,26 @@ const FeatureCard: React.FC<{
 
 export default function HubPage() {
   const user = useAuthStore((state) => state.user);
+  const clearAuth = useAuthStore((state) => state.clearAuth);
   const isAdmin = user?.role === 'admin';
+  const router = useRouter();
+
+  const handleLogout = () => {
+    clearAuth();
+    router.replace('/');
+  };
 
   return (
     <div className="p-8">
+      <div className="flex justify-between items-center mb-4">
+        <div></div>
+        <button
+          onClick={handleLogout}
+          className="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded"
+        >
+          Sair
+        </button>
+      </div>
       <h1 className="text-4xl font-bold text-white mb-4">Bem-vindo, {user?.email}!</h1>
       <p className="text-text-secondary text-lg mb-8">
         Explore as funcionalidades do Dr. Tilápia, seu assistente de IA para piscicultura.
@@ -39,12 +57,14 @@ export default function HubPage() {
           description="Obtenha respostas instantâneas e insights especializados sobre piscicultura."
           href="/main/consultoria"
         />
+
         <FeatureCard
           icon={BarChart2Icon}
           title="Dashboard de Métricas"
           description="Visualize dados e métricas importantes para otimizar sua produção."
           href="/main/dashboard"
         />
+
         {isAdmin ? (
           <FeatureCard
             icon={UploadCloudIcon}
@@ -61,6 +81,7 @@ export default function HubPage() {
             disabled
           />
         )}
+
         <FeatureCard
           icon={UserIcon}
           title="Meu Perfil"

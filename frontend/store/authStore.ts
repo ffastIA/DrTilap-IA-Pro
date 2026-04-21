@@ -1,4 +1,4 @@
-// CAMINHO: store/authStore.ts
+// CAMINHO: frontend/store/authStore.ts
 
 import { create } from 'zustand';
 import Cookies from 'js-cookie';
@@ -25,13 +25,13 @@ export const useAuthStore = create<AuthStore>((set) => ({
   isAuthenticated: false,
   isLoading: true,
   setAuth: (token, user) => {
-    Cookies.set('accessToken', token, { expires: 7 });
-    Cookies.set('user', JSON.stringify(user), { expires: 7 });
+    Cookies.set('accessToken', token, { path: '/', sameSite: 'Lax' });
+    Cookies.set('user', JSON.stringify(user), { path: '/', sameSite: 'Lax' });
     set({ token, user, isAuthenticated: true, isLoading: false });
   },
   clearAuth: () => {
-    Cookies.remove('accessToken');
-    Cookies.remove('user');
+    Cookies.remove('accessToken', { path: '/' });
+    Cookies.remove('user', { path: '/' });
     set({ token: null, user: null, isAuthenticated: false, isLoading: false });
   },
   restoreAuth: () => {
@@ -43,8 +43,8 @@ export const useAuthStore = create<AuthStore>((set) => ({
         set({ token, user, isAuthenticated: true, isLoading: false });
       } catch {
         // JSON inválido, limpar cookies
-        Cookies.remove('accessToken');
-        Cookies.remove('user');
+        Cookies.remove('accessToken', { path: '/' });
+        Cookies.remove('user', { path: '/' });
         set({ token: null, user: null, isAuthenticated: false, isLoading: false });
       }
     } else {
