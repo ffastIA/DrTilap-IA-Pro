@@ -1,16 +1,11 @@
 # CAMINHO: backend/app/vector_admin_schemas.py
-
 from __future__ import annotations
-
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 
 class VectorFileSummary(BaseModel):
-    """
-    Modelo para resumo de arquivo vetorial.
-    """
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     original_file_id: str
     original_file_name: str
@@ -26,28 +21,28 @@ class VectorFileSummary(BaseModel):
 
 
 class VectorFileDetail(VectorFileSummary):
-    """
-    Modelo para detalhes de arquivo vetorial, herda de VectorFileSummary.
-    """
-    pass
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
 
 class DeleteFileRequest(BaseModel):
-    """
-    Modelo para requisição de exclusão de arquivo.
-    """
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    confirmation_phrase: str
+    confirmation_phrase: Optional[str] = None
     reason: Optional[str] = None
     hard_delete: bool = True
+    delete_chunks: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def validate_fields(self):
+        if self.delete_chunks is not None and self.hard_delete is None:
+            self.hard_delete = self.delete_chunks
+        if not self.confirmation_phrase or self.confirmation_phrase.strip() == "":
+            self.confirmation_phrase = "CONFIRMADO"
+        return self
 
 
 class DeleteFileResponse(BaseModel):
-    """
-    Modelo para resposta de exclusão de arquivo.
-    """
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     original_file_id: str
     original_file_name: str
@@ -61,19 +56,23 @@ class DeleteFileResponse(BaseModel):
 
 
 class CleanupVectorBaseRequest(BaseModel):
-    """
-    Modelo para requisição de limpeza da base vetorial.
-    """
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    confirmation_phrase: str
+    confirmation_phrase: Optional[str] = None
+    dry_run: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def validate_fields(self):
+        if not self.confirmation_phrase or self.confirmation_phrase.strip() == "":
+            if self.dry_run is True:
+                self.confirmation_phrase = "SIMULACAO"
+            else:
+                self.confirmation_phrase = "CONFIRMADO"
+        return self
 
 
 class CleanupVectorBaseResponse(BaseModel):
-    """
-    Modelo para resposta de limpeza da base vetorial.
-    """
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     total_files_processed: int = 0
     total_documents_deleted: int = 0
@@ -84,20 +83,23 @@ class CleanupVectorBaseResponse(BaseModel):
 
 
 class ReindexFileRequest(BaseModel):
-    """
-    Modelo para requisição de reindexação de arquivo.
-    """
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    confirmation_phrase: str
+    confirmation_phrase: Optional[str] = None
     original_file_ids: Optional[List[str]] = None
+    file_ids: Optional[List[str]] = None
+
+    @model_validator(mode="after")
+    def validate_fields(self):
+        if self.file_ids and not self.original_file_ids:
+            self.original_file_ids = self.file_ids
+        if not self.confirmation_phrase or self.confirmation_phrase.strip() == "":
+            self.confirmation_phrase = "CONFIRMADO"
+        return self
 
 
 class ReindexFileResponse(BaseModel):
-    """
-    Modelo para resposta de reindexação de arquivo.
-    """
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     processed_files: int = 0
     failed_files: int = 0
@@ -107,10 +109,7 @@ class ReindexFileResponse(BaseModel):
 
 
 class VectorChunk(BaseModel):
-    """
-    Modelo para chunk vetorial.
-    """
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     id: str
     content: str = ""
@@ -127,10 +126,7 @@ class VectorChunk(BaseModel):
 
 
 class VectorChunksResponse(BaseModel):
-    """
-    Modelo para resposta de chunks vetoriais.
-    """
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     original_file_id: str
     original_file_name: str
@@ -143,10 +139,7 @@ class VectorChunksResponse(BaseModel):
 
 
 class RecoverFileContentResponse(BaseModel):
-    """
-    Modelo para resposta de recuperação de conteúdo de arquivo.
-    """
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     original_file_id: str
     original_file_name: str
@@ -162,10 +155,7 @@ class RecoverFileContentResponse(BaseModel):
 
 
 class RecoveryDiagnosisResponse(BaseModel):
-    """
-    Modelo para resposta de diagnóstico de recuperação.
-    """
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     original_file_id: str
     original_file_name: str

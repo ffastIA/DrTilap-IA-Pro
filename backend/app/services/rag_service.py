@@ -1,5 +1,4 @@
 # CAMINHO: backend/app/services/rag_service.py
-
 import uuid
 import logging
 from pathlib import Path
@@ -10,189 +9,123 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from app.database import supabase_admin
 
-
 class RAGService:
-    """
-    Serviço para processamento de documentos PDF usando RAG (Retrieval-Augmented Generation).
-    """
-
     def __init__(self):
-        """
-        Inicializa o serviço RAG com embeddings, LLM e conexão com Supabase.
-        """
         self.embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
         self.llm = ChatOpenAI(model="gpt-4o", temperature=0)
         self.supabase = supabase_admin
         self.storage_bucket = "rag-documents"
         self.embedding_batch_size = 20
         self.insert_batch_size = 20
+        self.logger = logging.getLogger(__name__)
 
     async def ingest_pdf(self, file_path: str, filename: str, original_file_id: Optional[str] = None, cleanup_existing: bool = False) -> Dict[str, Any]:
-        """
-        Ingere um PDF, processa em chunks, gera embeddings e armazena no Supabase.
-
-        Args:
-            file_path: Caminho local do arquivo PDF.
-            filename: Nome do arquivo.
-            original_file_id: ID único do arquivo (gerado se não informado).
-            cleanup_existing: Se True, remove chunks existentes para o original_file_id.
-
-        Returns:
-            Dicionário com informações do processamento.
-        """
-        if not original_file_id:
+        if not Path(file_path).exists():
+            raise FileNotFoundError(f"Arquivo não encontrado: {file_path}")
+        if original_file_id is None:
             original_file_id = str(uuid.uuid4())
-
-        logging.info(f"Iniciando ingestão do PDF: {filename} com ID {original_file_id}")
-
-        # Carregar o PDF
         loader = PyPDFLoader(file_path)
         documents = loader.load()
-
-        # Dividir em chunks
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            separators=["\n\n", "\n", ".", " ", ""]
-        )
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         chunks = text_splitter.split_documents(documents)
-
-        # Upload do PDF original para o storage
+        if not chunks:
+            raise ValueError("Nenhum chunk foi gerado do PDF.")
         storage_path = f"uploads/{original_file_id}/{filename}"
         with open(file_path, "rb") as f:
             self.supabase.storage.from_(self.storage_bucket).upload(storage_path, f)
-
-        # Limpar chunks existentes se solicitado
         if cleanup_existing:
             await self._delete_existing_document_chunks(original_file_id)
-
-        # Montar payloads
         payloads = self._build_chunk_payloads(chunks, original_file_id, filename, self.storage_bucket, storage_path)
-
-        # Gerar embeddings em lotes
         await self._generate_embeddings_in_payloads(payloads)
-
-        # Inserir na tabela em lotes
-        await self._insert_payload_batches(payloads)
-
-        logging.info(f"Ingestão concluída para {filename}")
+        inserted_count = await self._insert_payload_batches(payloads)
+        persisted_chunks = self._verify_persisted_chunks(original_file_id)
+        if persisted_chunks <= 0:
+            raise RuntimeError(f"Nenhum chunk foi persistido para original_file_id: {original_file_id}")
         return {
             "message": "PDF ingerido com sucesso",
             "original_file_id": original_file_id,
             "original_file_name": filename,
             "chunks_criados": len(chunks),
+            "persisted_chunks": persisted_chunks,
             "storage_bucket": self.storage_bucket,
             "storage_path": storage_path
         }
 
     async def get_answer(self, question: str, chat_history: List[Tuple[str, str]]) -> Dict[str, Any]:
-        """
-        Gera uma resposta para a pergunta usando RAG.
-
-        Args:
-            question: Pergunta do usuário.
-            chat_history: Histórico do chat.
-
-        Returns:
-            Dicionário com resposta e fontes.
-        """
-        logging.info(f"Gerando resposta para pergunta: {question}")
-
-        # Gerar embedding da pergunta
         query_embedding = self.embeddings.embed_query(question)
-
-        # Buscar documentos similares via RPC
         response = self.supabase.rpc("match_documents", {
             "query_embedding": query_embedding,
             "match_count": 5,
             "similarity_threshold": 0.7
         }).execute()
+        docs = response.data or []
+        normalized_docs = [self._normalize_match_doc(doc) for doc in docs]
+        if not any(doc.get('content') for doc in normalized_docs):
+            normalized_docs = await self._best_effort_fetch_recent_chunks(limit=5)
+        context = self._build_context_from_docs(normalized_docs)
+        if not context:
+            return {
+                "answer": "Desculpe, não encontrei conteúdo suficiente na base de conhecimento para responder à sua pergunta sobre piscicultura e tilápia.",
+                "sources": []
+            }
+        prompt = f"""
+Você é um assistente especializado em piscicultura e tilápia. Responda à pergunta do usuário com base no contexto fornecido.
 
-        docs = response.data if response.data else []
-        docs = [self._normalize_match_doc(doc) for doc in docs if doc]
+Contexto:
 
-        # Fallback se não houver conteúdo suficiente
-        if not docs or not any(self._safe_content(doc) for doc in docs):
-            logging.warning("RPC não retornou conteúdo suficiente, usando fallback")
-            docs = await self._fetch_document_chunks_by_original_file_id(None)  # Ajustar se necessário
+{context}
 
-        # Montar contexto
-        context = self._build_context_from_docs(docs)
+Pergunta: {question}
 
-        # Gerar resposta com LLM
-        prompt = f"Histórico: {chat_history}\nContexto: {context}\nPergunta: {question}\nResponda baseado no contexto."
+Histórico do chat:
+
+{chat_history}
+
+Responda de forma clara e precisa.
+
+"""
         answer = self.llm.invoke(prompt).content
-
-        sources = [{
-            "original_file_name": doc.get("original_file_name", ""),
-            "page": self._safe_page_from_metadata(doc.get("metadata", {})),
-            "content": self._safe_content(doc)
-        } for doc in docs]
-
+        sources = [{"original_file_name": doc.get("original_file_name"), "page": doc.get("metadata", {}).get("page")} for doc in normalized_docs if doc.get("content")]
         return {
             "answer": answer,
             "sources": sources
         }
 
     async def reindex_file_from_storage(self, file_info: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Reindexa um arquivo do storage.
-
-        Args:
-            file_info: Dicionário com storage_bucket, storage_path, original_file_name.
-
-        Returns:
-            Resultado da reingestão.
-        """
-        storage_bucket = file_info["storage_bucket"]
-        storage_path = file_info["storage_path"]
-        original_file_name = file_info["original_file_name"]
         original_file_id = file_info.get("original_file_id")
-
-        logging.info(f"Reindexando arquivo: {original_file_name}")
-
-        # Baixar para temporário
-        temp_dir = gettempdir()
-        temp_path = Path(temp_dir) / f"temp_{uuid.uuid4()}.pdf"
-        with open(temp_path, "wb") as f:
-            res = self.supabase.storage.from_(storage_bucket).download(storage_path)
-            f.write(res)
-
-        # Reingerir
-        result = await self.ingest_pdf(str(temp_path), original_file_name, original_file_id, cleanup_existing=True)
-
-        # Limpar temporário
-        temp_path.unlink()
-
-        return result
+        filename = file_info.get("original_file_name")
+        storage_path = file_info.get("storage_path")
+        temp_dir = Path(gettempdir())
+        temp_file = temp_dir / filename
+        try:
+            with open(temp_file, "wb") as f:
+                res = self.supabase.storage.from_(self.storage_bucket).download(storage_path)
+                f.write(res)
+            result = await self.ingest_pdf(str(temp_file), filename, original_file_id, cleanup_existing=True)
+            return result
+        finally:
+            if temp_file.exists():
+                temp_file.unlink()
 
     def _build_chunk_payloads(self, chunks, original_file_id, original_file_name, storage_bucket, storage_path):
-        """
-        Monta payloads para os chunks.
-        """
         payloads = []
         for chunk in chunks:
-            payloads.append({
+            payload = {
                 "content": chunk.page_content,
                 "metadata": chunk.metadata,
                 "original_file_id": original_file_id,
                 "original_file_name": original_file_name,
                 "storage_bucket": storage_bucket,
                 "storage_path": storage_path
-            })
+            }
+            payloads.append(payload)
         return payloads
 
     def _chunk_list(self, lst, n):
-        """
-        Divide uma lista em chunks de tamanho n.
-        """
         for i in range(0, len(lst), n):
             yield lst[i:i + n]
 
     async def _generate_embeddings_in_payloads(self, payloads):
-        """
-        Gera embeddings para os payloads em lotes.
-        """
         for batch in self._chunk_list(payloads, self.embedding_batch_size):
             contents = [p["content"] for p in batch]
             embeddings = self.embeddings.embed_documents(contents)
@@ -200,52 +133,64 @@ class RAGService:
                 p["embedding"] = emb
 
     async def _insert_payload_batches(self, payloads):
-        """
-        Insere payloads na tabela em lotes.
-        """
+        total_inserted = 0
         for batch in self._chunk_list(payloads, self.insert_batch_size):
-            self.supabase.table("documents").insert(batch).execute()
+            self.logger.info(f"Inserindo batch de {len(batch)} payloads")
+            response = self.supabase.table("documents").insert(batch).execute()
+            total_inserted += len(response.data or [])
+        return total_inserted
+
+    def _verify_persisted_chunks(self, original_file_id):
+        response = self.supabase.table("documents").select("id").eq("original_file_id", original_file_id).execute()
+        return len(response.data or [])
+
+    async def _best_effort_fetch_recent_chunks(self, limit=5):
+        try:
+            response = self.supabase.table("documents").select("*").order("created_at", desc=True).limit(limit).execute()
+            docs = response.data or []
+            return [self._normalize_match_doc(doc) for doc in docs]
+        except Exception as e:
+            self.logger.warning(f"Falha ao buscar chunks recentes: {e}")
+            return []
 
     async def _fetch_document_chunks_by_original_file_id(self, original_file_id):
-        """
-        Busca chunks por original_file_id.
-        """
+        if original_file_id is None:
+            return []
         response = self.supabase.table("documents").select("*").eq("original_file_id", original_file_id).execute()
-        return response.data
+        return response.data or []
 
     def _normalize_match_doc(self, doc):
-        """
-        Normaliza documento retornado pela RPC.
-        """
-        return doc
+        return {
+            "content": doc.get("content", ""),
+            "metadata": doc.get("metadata", {}),
+            "original_file_name": doc.get("original_file_name", ""),
+            "original_file_id": doc.get("original_file_id", "")
+        }
 
     def _build_context_from_docs(self, docs):
-        """
-        Monta contexto a partir dos documentos.
-        """
-        context = ""
+        context_parts = []
         for doc in docs:
-            context += f"Arquivo: {doc.get('original_file_name', '')}, Página: {self._safe_page_from_metadata(doc.get('metadata', {}))}, Conteúdo: {self._safe_content(doc)}\n"
-        return context
+            content = doc.get("content", "").strip()
+            if content:
+                file_name = doc.get("original_file_name", "Arquivo desconhecido")
+                page = self._safe_page_from_metadata(doc.get("metadata", {}))
+                if page:
+                    context_parts.append(f"Arquivo: {file_name}, Página: {page}\n{content}")
+                else:
+                    context_parts.append(f"Arquivo: {file_name}\n{content}")
+        return "\n\n".join(context_parts)
 
     async def _delete_existing_document_chunks(self, original_file_id):
-        """
-        Remove chunks existentes para o original_file_id.
-        """
         self.supabase.table("documents").delete().eq("original_file_id", original_file_id).execute()
 
     def _safe_page_from_metadata(self, metadata):
-        """
-        Extrai página de forma segura.
-        """
-        return metadata.get("page", 0)
+        if isinstance(metadata, dict):
+            page = metadata.get("page")
+            if isinstance(page, int):
+                return page
+        return None
 
     def _safe_content(self, doc):
-        """
-        Extrai conteúdo de forma segura.
-        """
-        return doc.get("content", "")
+        return doc.get("content", "").strip()
 
-
-# Exportar instância do serviço
 rag_service = RAGService()
