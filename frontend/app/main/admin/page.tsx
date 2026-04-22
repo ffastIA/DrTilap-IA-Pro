@@ -1,33 +1,53 @@
 // CAMINHO: frontend/app/main/admin/page.tsx
+
 'use client';
 
-import { useCallback, useMemo, useState } from 'react';
+import { ChangeEvent, useMemo, useRef } from 'react';
 import useRagAdmin from '@/hooks/useRagAdmin';
-import RagUploadPanel from '@/components/admin/RagUploadPanel';
-import RagDocumentsList from '@/components/admin/RagDocumentsList';
-import ConfirmActionModal from '@/components/admin/ConfirmActionModal';
 
-export default function AdminPage() {
+type Metadata = Record<string, any>;
+
+type Document = {
+  id: string;
+  title: string;
+  createdAt: Date | null;
+  updatedAt: Date | null;
+  metadata?: Metadata;
+};
+
+function formatDate(value: Date | null | undefined, hasValid?: boolean): string {
+  if (hasValid === false || !value || isNaN(value.getTime())) {
+    return 'Data indisponível';
+  }
+  return new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeStyle: 'short' }).format(value);
+}
+
+function getChunks(metadata?: Metadata): number {
+  return Number(metadata?.total_chunks ?? metadata?.active_chunks ?? 0);
+}
+
+function safeSource(item: Document): string {
+  const source = item.metadata?.source || item.title;
+  if (source.includes('AppData') || source.includes('Temp') || source.includes('tmp')) {
+    return item.title;
+  }
+  return source;
+}
+
+export default function Page() {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   const {
     items,
-    total,
-    page,
-    limit,
-    selectedItem,
-    criticalAction,
-    isDeleteModalOpen,
     isLoadingList,
     isUploading,
     isDeleting,
     isClearing,
     isReindexing,
-    listError,
+    selectedItem,
+    isDeleteModalOpen,
     operationMessage,
     operationError,
-    lastUploadResponse,
-    lastDeleteResponse,
-    lastClearResponse,
-    lastReindexResponse,
     refreshList,
     uploadFiles,
     openDeleteModal,
@@ -38,213 +58,148 @@ export default function AdminPage() {
     resetFeedback,
   } = useRagAdmin();
 
-  const [isClearModalOpen, setIsClearModalOpen] = useState(false);
-  const [isReindexModalOpen, setIsReindexModalOpen] = useState(false);
-  const [clearMode, setClearMode] = useState<'simulate' | 'execute'>('simulate');
-
-  const closeAllLocalModals = useCallback(() => {
-    setIsClearModalOpen(false);
-    setIsReindexModalOpen(false);
-  }, []);
-
-  const statusBadge = useMemo(() => {
-    if (isUploading) return { text: 'Enviando', color: 'bg-blue-500' };
-    if (isDeleting) return { text: 'Excluindo', color: 'bg-red-500' };
-    if (isClearing) return { text: 'Limpando', color: 'bg-orange-500' };
-    if (isReindexing) return { text: 'Reindexando', color: 'bg-purple-500' };
-    return { text: 'Pronto', color: 'bg-green-500' };
-  }, [isUploading, isDeleting, isClearing, isReindexing]);
-
-  const recentActivity = useMemo(() => {
-    const activities = [];
-    if (lastDeleteResponse) {
-      activities.push(
-        `Exclusão: ${lastDeleteResponse.deleted?.length || 0} deletados, ${lastDeleteResponse.failed?.length || 0} falharam.`
-      );
+  const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    const validFiles = files.filter((f) => f.name.toLowerCase().endsWith('.pdf'));
+    if (validFiles.length > 0) {
+      uploadFiles(validFiles);
     }
-    if (lastClearResponse) {
-      activities.push(
-        `Limpeza: ${lastClearResponse.cleared || 0} limpos, total ${lastClearResponse.count || 0}.`
-      );
+    e.target.value = '';
+  };
+
+  const handleClearDatabase = () => {
+    if (window.confirm('Limpeza definitiva da base de dados? Todos os documentos serão removidos permanentemente.')) {
+      clearDatabase(true);
     }
-    if (lastReindexResponse) {
-      activities.push(
-        `Reindexação: ${lastReindexResponse.reindexed || 0} reindexados, total ${lastReindexResponse.count || 0}, status: ${lastReindexResponse.status || 'Desconhecido'}.`
-      );
-    }
-    return activities;
-  }, [lastDeleteResponse, lastClearResponse, lastReindexResponse]);
-
-  const handleClearSimulate = useCallback(() => {
-    setClearMode('simulate');
-    setIsClearModalOpen(true);
-  }, []);
-
-  const handleClearExecute = useCallback(() => {
-    setClearMode('execute');
-    setIsClearModalOpen(true);
-  }, []);
-
-  const handleReindex = useCallback(() => {
-    setIsReindexModalOpen(true);
-  }, []);
-
-  const handleConfirmClear = useCallback(async () => {
-    await clearDatabase(clearMode === 'execute');
-    closeAllLocalModals();
-  }, [clearDatabase, clearMode, closeAllLocalModals]);
-
-  const handleConfirmReindex = useCallback(async () => {
-    await reindexDatabase();
-    closeAllLocalModals();
-  }, [reindexDatabase, closeAllLocalModals]);
-
-  const isAnyCriticalAction = isDeleting || isClearing || isReindexing;
+  };
 
   return (
-    <div className="min-h-screen bg-gray-900 text-white p-6">
-      <div className="max-w-7xl mx-auto space-y-6">
-        {/* Cabeçalho */}
-        <div className="bg-gray-800/50 backdrop-blur-sm rounded-lg p-6 border border-gray-700">
-          <h1 className="text-3xl font-bold mb-2">Administração do RAG</h1>
-          <p className="text-gray-300 mb-4">
-            Gerencie documentos e base de conhecimento. Upload ainda depende da confirmação do endpoint real do backend.
-          </p>
-          <div className="flex flex-wrap gap-4 text-sm">
-            <span className="bg-gray-700 px-3 py-1 rounded">Total: {total}</span>
-            <span className="bg-gray-700 px-3 py-1 rounded">Página: {page}</span>
-            <span className="bg-gray-700 px-3 py-1 rounded">Limite: {limit}</span>
-            <span className={`px-3 py-1 rounded text-white ${statusBadge.color}`}>{statusBadge.text}</span>
-          </div>
+    <div className="container mx-auto p-8 max-w-7xl">
+      {/* Feedback Messages */}
+      {operationMessage && (
+        <div className="bg-green-500 text-white p-4 rounded mb-4 flex justify-between items-center">
+          <span>{operationMessage}</span>
+          <button
+            onClick={resetFeedback}
+            className="ml-4 px-2 py-1 bg-green-600 rounded hover:bg-green-700"
+          >
+            ✕
+          </button>
         </div>
-
-        {/* Grid Principal */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Upload */}
-          <div className="bg-gray-800/50 backdrop-blur-sm rounded-lg p-6 border border-gray-700">
-            <RagUploadPanel
-              isUploading={isUploading}
-              operationMessage={operationMessage}
-              operationError={operationError}
-              lastUploadResponse={lastUploadResponse}
-              onUpload={uploadFiles}
-              onResetFeedback={resetFeedback}
-              title="Upload de Documentos"
-              description="Selecione arquivos para adicionar à base de conhecimento."
-              accept=".pdf,.txt,.docx"
-              multiple={true}
-              showMetadataFields={true}
-            />
-          </div>
-
-          {/* Feedback e Atividade */}
-          <div className="bg-gray-800/50 backdrop-blur-sm rounded-lg p-6 border border-gray-700 space-y-4">
-            <h2 className="text-xl font-semibold">Atividade Recente</h2>
-            {recentActivity.length > 0 ? (
-              <ul className="space-y-2 text-sm text-gray-300">
-                {recentActivity.map((activity, index) => (
-                  <li key={index} className="bg-gray-700/50 p-2 rounded">{activity}</li>
-                ))}
-              </ul>
-            ) : (
-              <p className="text-gray-500">Nenhuma atividade recente.</p>
-            )}
-          </div>
+      )}
+      {operationError?.message && (
+        <div className="bg-red-500 text-white p-4 rounded mb-4 flex justify-between items-center">
+          <span>{operationError.message}</span>
+          <button
+            onClick={resetFeedback}
+            className="ml-4 px-2 py-1 bg-red-600 rounded hover:bg-red-700"
+          >
+            ✕
+          </button>
         </div>
+      )}
 
-        {/* Lista de Documentos */}
-        <div className="bg-gray-800/50 backdrop-blur-sm rounded-lg p-6 border border-gray-700">
-          <RagDocumentsList
-            items={items}
-            total={total}
-            isLoading={isLoadingList}
-            error={listError}
-            onRefresh={refreshList}
-            onDelete={openDeleteModal}
-            title="Documentos na Base"
-            description="Lista de documentos carregados."
-            emptyTitle="Nenhum documento encontrado"
-            emptyDescription="Faça upload de documentos para começar."
-          />
-        </div>
-
-        {/* Zona Crítica */}
-        <div className="bg-red-900/20 backdrop-blur-sm rounded-lg p-6 border border-red-700">
-          <h2 className="text-xl font-semibold text-red-400 mb-4">Zona Crítica</h2>
-          <p className="text-gray-300 mb-4">Ações destrutivas. Use com cautela.</p>
-          <div className="flex flex-wrap gap-4">
-            <button
-              onClick={handleClearSimulate}
-              disabled={isAnyCriticalAction}
-              className="bg-orange-600 hover:bg-orange-700 disabled:bg-gray-600 px-4 py-2 rounded text-white"
-            >
-              Simular Limpeza
-            </button>
-            <button
-              onClick={handleClearExecute}
-              disabled={isAnyCriticalAction}
-              className="bg-red-600 hover:bg-red-700 disabled:bg-gray-600 px-4 py-2 rounded text-white"
-            >
-              Executar Limpeza
-            </button>
-            <button
-              onClick={handleReindex}
-              disabled={isAnyCriticalAction}
-              className="bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 px-4 py-2 rounded text-white"
-            >
-              Reindexar Base
-            </button>
-          </div>
-        </div>
+      {/* Upload Area */}
+      <div className="mb-8">
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          disabled={isUploading}
+          className="bg-blue-500 hover:bg-blue-600 text-white px-6 py-3 rounded-lg font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {isUploading ? 'Enviando...' : 'Carregar PDFs'}
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept=".pdf"
+          onChange={handleFileChange}
+          className="hidden"
+        />
       </div>
 
-      {/* Modais */}
-      <ConfirmActionModal
-        isOpen={isDeleteModalOpen}
-        actionType={criticalAction}
-        selectedItem={selectedItem}
-        isDeleting={isDeleting}
-        isClearing={isClearing}
-        isReindexing={isReindexing}
-        onClose={closeDeleteModal}
-        onConfirmDelete={async () => { await deleteSelectedItem(); }}
-        onConfirmClear={() => {}}
-        onConfirmReindex={() => {}}
-      />
+      {/* Main Actions */}
+      <div className="flex flex-wrap gap-4 mb-8">
+        <button
+          onClick={refreshList}
+          disabled={isLoadingList}
+          className="bg-gray-500 hover:bg-gray-600 text-white px-6 py-3 rounded-lg font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          Atualizar lista
+        </button>
+        <button
+          onClick={() => reindexDatabase()}
+          disabled={isReindexing}
+          className="bg-yellow-500 hover:bg-yellow-600 text-white px-6 py-3 rounded-lg font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          Reindexar base
+        </button>
+        <button
+          onClick={handleClearDatabase}
+          disabled={isClearing}
+          className="bg-red-500 hover:bg-red-600 text-white px-6 py-3 rounded-lg font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          Limpeza definitiva
+        </button>
+      </div>
 
-      <ConfirmActionModal
-        isOpen={isClearModalOpen}
-        actionType="clear_all"
-        selectedItem={null}
-        isDeleting={isDeleting}
-        isClearing={isClearing}
-        isReindexing={isReindexing}
-        onClose={closeAllLocalModals}
-        onConfirmDelete={() => {}}
-        onConfirmClear={handleConfirmClear}
-        onConfirmReindex={() => {}}
-        title={clearMode === 'simulate' ? 'Simular Limpeza da Base' : 'Executar Limpeza da Base'}
-        description={clearMode === 'simulate' ? 'Isso simulará a limpeza sem afetar os dados.' : 'Isso removerá todos os documentos permanentemente.'}
-        confirmLabel={clearMode === 'simulate' ? 'Simular' : 'Executar'}
-        cancelLabel="Cancelar"
-      />
+      {/* Documents List */}
+      <div>
+        {isLoadingList ? (
+          <div className="text-center py-12 text-lg">Carregando documentos...</div>
+        ) : items.length === 0 ? (
+          <div className="text-center py-12 text-lg text-gray-500">Nenhum documento indexado no momento.</div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {items.map((item) => (
+              <div key={item.id} className="bg-white border border-gray-200 rounded-lg shadow-sm p-6 hover:shadow-md transition-shadow">
+                <h3 className="text-xl font-semibold mb-2 truncate">{item.title}</h3>
+                <p className="text-sm text-gray-600 mb-1"><strong>ID:</strong> {item.id}</p>
+                <p className="text-sm text-gray-600 mb-1"><strong>Inserido em:</strong> {formatDate(item.createdAt, item.metadata?.hasValidCreatedAt)}</p>
+                <p className="text-sm text-gray-600 mb-1"><strong>Atualizado em:</strong> {formatDate(item.updatedAt, item.metadata?.hasValidUpdatedAt)}</p>
+                <p className="text-sm text-gray-600 mb-3"><strong>Source:</strong> {safeSource(item)}</p>
+                <p className="text-sm text-gray-600 mb-4"><strong>Chunks:</strong> {getChunks(item.metadata)}</p>
+                <button
+                  onClick={() => openDeleteModal(item)}
+                  className="w-full bg-red-500 hover:bg-red-600 text-white py-2 px-4 rounded-md font-medium transition-colors"
+                >
+                  Excluir
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
 
-      <ConfirmActionModal
-        isOpen={isReindexModalOpen}
-        actionType="reindex"
-        selectedItem={null}
-        isDeleting={isDeleting}
-        isClearing={isClearing}
-        isReindexing={isReindexing}
-        onClose={closeAllLocalModals}
-        onConfirmDelete={() => {}}
-        onConfirmClear={() => {}}
-        onConfirmReindex={handleConfirmReindex}
-        title="Reindexar Base de Dados"
-        description="Isso reindexará todos os documentos para otimizar a busca."
-        confirmLabel="Reindexar"
-        cancelLabel="Cancelar"
-      />
+      {/* Delete Modal */}
+      {isDeleteModalOpen && selectedItem && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-lg shadow-xl max-w-md w-full max-h-[90vh] overflow-y-auto">
+            <div className="p-6">
+              <h2 className="text-2xl font-bold text-gray-900 mb-4">Confirmar exclusão</h2>
+              <p className="text-lg text-gray-700 mb-6">
+                Tem certeza que deseja excluir o documento <strong>&quot;{selectedItem.title}&quot;</strong>?
+              </p>
+              <div className="flex gap-3 justify-end">
+                <button
+                  onClick={closeDeleteModal}
+                  disabled={isDeleting}
+                  className="px-6 py-2 border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50 font-medium disabled:opacity-50"
+                >
+                  Cancelar
+                </button>
+                <button
+                  onClick={deleteSelectedItem}
+                  disabled={isDeleting}
+                  className="px-6 py-2 bg-red-500 hover:bg-red-600 text-white rounded-md font-medium disabled:opacity-50 transition-colors"
+                >
+                  {isDeleting ? 'Excluindo...' : 'Confirmar'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

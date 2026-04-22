@@ -11,120 +11,199 @@ export const RAG_ADMIN_ENDPOINTS = {
   REINDEX: '/admin/vector-base/reindex',
 } as const;
 
-export type RagOperationStatusResponse = { status: 'completed' | 'in_progress' | 'failed'; progress?: number; message?: string; jobId?: string };
+export type RagOperationStatusResponse = {
+  status: 'completed' | 'in_progress' | 'failed';
+  progress?: number;
+  message?: string;
+  jobId?: string;
+};
 
-// Helper functions
-function extractBody<T>(response: any): T {
-  return response.data || response;
+function extractBody(response: any): any {
+  return response?.data ?? response?.body ?? response ?? null;
 }
 
-function getFirstDefined<T>(...values: (T | undefined | null)[]): T | undefined {
-  return values.find(v => v !== undefined && v !== null);
-}
-
-function toDate(value: any): Date {
-  if (value instanceof Date) return value;
-  if (typeof value === 'string' || typeof value === 'number') {
-    const date = new Date(value);
-    return isNaN(date.getTime()) ? new Date(0) : date;
+function getFirstDefined<T>(...values: Array<T | null | undefined | ''>): T | undefined {
+  for (const value of values) {
+    if (value != null && value !== '') {
+      return value as T;
+    }
   }
-  return new Date(0);
+  return undefined;
+}
+
+function toDateOrNull(value: unknown): Date | null {
+  if (!value) return null;
+  const date = new Date(value);
+  return isNaN(date.getTime()) ? null : date;
 }
 
 function normalizeItem(raw: any): RagItem | null {
-  const id = getFirstDefined(raw.original_file_id, raw.id, raw.file_id, raw.document_id);
-  if (!id || typeof id !== 'string' || id.trim() === '') return null;
+  const id = getFirstDefined(
+    raw?.original_file_id,
+    raw?.id,
+    raw?.file_id,
+    raw?.document_id
+  ) as string | undefined;
 
-  const title = getFirstDefined(raw.original_file_name, raw.filename, raw.file_name, raw.title, raw.name) || 'Sem título';
-  const content = getFirstDefined(raw.content, raw.summary, raw.text) || '';
-  const metadata = (typeof raw.metadata === 'object' && raw.metadata !== null) ? raw.metadata : {};
-  const createdAt = toDate(getFirstDefined(raw.created_at, raw.createdAt, raw.uploaded_at));
-  const updatedAt = toDate(getFirstDefined(raw.updated_at, raw.updatedAt, raw.indexed_at));
+  if (!id) {
+    return null;
+  }
 
-  return { id, title, content, metadata, createdAt, updatedAt };
+  const title =
+    (getFirstDefined(
+      raw?.original_file_name,
+      raw?.filename,
+      raw?.file_name,
+      raw?.title,
+      raw?.name
+    ) as string) || 'Sem título';
+
+  const content =
+    (getFirstDefined(raw?.content, raw?.summary, raw?.text) as string) || '';
+
+  const createdSource = getFirstDefined(
+    raw?.last_ingested_at,
+    raw?.created_at,
+    raw?.createdAt,
+    raw?.metadata?.created_at
+  );
+
+  const updatedSource = getFirstDefined(
+    raw?.updated_at,
+    raw?.updatedAt,
+    raw?.last_ingested_at,
+    raw?.metadata?.updated_at
+  );
+
+  const createdAt = toDateOrNull(createdSource) || new Date('1970-01-01T00:00:00.000Z');
+  const updatedAt = toDateOrNull(updatedSource) || new Date('1970-01-01T00:00:00.000Z');
+
+  const metadata: RagItem['metadata'] = {
+    source: raw?.original_file_name || raw?.metadata?.source || title,
+    storage_bucket: raw?.storage_bucket,
+    storage_path: raw?.storage_path,
+    total_chunks: raw?.total_chunks,
+    active_chunks: raw?.active_chunks,
+    deleted_chunks: raw?.deleted_chunks,
+    status: raw?.status,
+    deleted_at: raw?.deleted_at,
+    hasValidCreatedAt: !!toDateOrNull(createdSource),
+    hasValidUpdatedAt: !!toDateOrNull(updatedSource),
+  };
+
+  return {
+    id,
+    title,
+    content,
+    metadata,
+    createdAt,
+    updatedAt,
+  };
 }
 
 function normalizeUploadItemFromResponse(raw: any, file: File): RagItem {
-  let item = normalizeItem(raw);
-  if (!item && raw.original_file_id) {
-    item = {
-      id: raw.original_file_id,
-      title: file.name || 'Arquivo enviado',
-      content: '',
-      metadata: {},
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-  }
+  const item = normalizeItem({ ...raw, original_file_name: file.name });
   if (!item) {
-    item = {
-      id: `upload-${file.name}-${Date.now()}`,
-      title: file.name || 'Arquivo enviado',
+    return {
+      id: raw?.id || raw?.original_file_id || '',
+      title: file.name,
       content: '',
-      metadata: {},
+      metadata: {
+        source: file.name,
+      },
       createdAt: new Date(),
       updatedAt: new Date(),
     };
   }
-  return item;
+  return {
+    ...item,
+    title: item.title || file.name,
+    metadata: {
+      ...item.metadata,
+      source: file.name,
+    },
+  };
 }
 
 function normalizeError(error: any): RagAdminError {
-  if (typeof error === 'string') return { message: error };
   return {
-    message: error?.message || 'Erro desconhecido',
+    message: error?.message || error?.error || 'Erro desconhecido',
     code: error?.code,
-    details: error?.details,
+    details: error?.details || error,
   };
 }
 
 export async function listRagDocuments(): Promise<RagListResponse> {
-  try {
-    const response = await api.get(RAG_ADMIN_ENDPOINTS.LIST);
-    const data = extractBody(response);
-    const rawItems = Array.isArray(data) ? data : data.items || [];
-    const items = rawItems.map(normalizeItem).filter((item): item is RagItem => item !== null && item.id.trim() !== '');
-    return { items, total: items.length, page: 1, limit: items.length };
-  } catch (error) {
-    throw normalizeError(error);
-  }
+  const response = await api.get(RAG_ADMIN_ENDPOINTS.LIST);
+  const body = extractBody(response);
+  const itemsRaw = body?.items || body || [];
+  const itemsRawArray = Array.isArray(itemsRaw) ? itemsRaw : [itemsRaw];
+  const items = itemsRawArray
+    .map(normalizeItem)
+    .filter((item): item is RagItem => item !== null && !!item.id) as RagItem[];
+  return {
+    items,
+    total: items.length,
+    page: 1,
+    limit: items.length,
+  };
 }
 
-export async function uploadRagDocuments(files: File[], extraData?: Record<string, any>): Promise<RagUploadResponse> {
-  if (!files || files.length === 0) {
-    throw new Error('Nenhum arquivo foi fornecido para upload.');
+export async function uploadRagDocuments(
+  files: File[],
+  extraData?: Record<string, any>
+): Promise<RagUploadResponse> {
+  if (!files?.length) {
+    throw new Error('Nenhum arquivo selecionado para upload.');
   }
+
   const uploaded: RagItem[] = [];
   const failed: { file: string; error: string }[] = [];
+
   for (const file of files) {
     try {
       const formData = new FormData();
       formData.append('file', file);
       if (extraData) {
-        for (const [key, value] of Object.entries(extraData)) {
-          formData.append(key, typeof value === 'object' ? JSON.stringify(value) : String(value));
-        }
+        Object.entries(extraData).forEach(([key, value]) => {
+          formData.append(key, String(value));
+        });
       }
       const response = await api.post(RAG_ADMIN_ENDPOINTS.UPLOAD, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
-      const data = extractBody(response);
-      const item = normalizeUploadItemFromResponse(data, file);
+      const body = extractBody(response);
+      const item = normalizeUploadItemFromResponse(body, file);
       uploaded.push(item);
     } catch (error) {
-      failed.push({ file: file.name, error: normalizeError(error).message });
+      failed.push({
+        file: file.name,
+        error: normalizeError(error).message,
+      });
     }
   }
-  return { uploaded, failed, totalUploaded: uploaded.length, totalFailed: failed.length };
+
+  return {
+    uploaded,
+    failed,
+    totalUploaded: uploaded.length,
+    totalFailed: failed.length,
+  };
 }
 
-export async function deleteRagDocument(payload: RagDeletePayload | { id?: string; ids?: string[]; delete_chunks?: boolean; [key: string]: unknown }): Promise<RagDeleteResponse> {
-  const ids = [
-    ...(payload.ids || []),
-    ...(payload.id ? [payload.id] : []),
-  ].filter(id => id && typeof id === 'string' && id.trim() !== '');
+export async function deleteRagDocument(
+  payload: RagDeletePayload | { id?: string; ids?: string[]; delete_chunks?: boolean; [key: string]: unknown }
+): Promise<RagDeleteResponse> {
+  let ids: string[] = [];
+  if (Array.isArray(payload.ids)) {
+    ids.push(...payload.ids);
+  }
+  if (payload.id) {
+    ids.push(payload.id);
+  }
+  ids = ids.filter((id) => !!id && id.trim().length > 0);
 
-  if (ids.length === 0) {
+  if (!ids.length) {
     throw new Error('Nenhum ID válido foi informado para exclusão.');
   }
 
@@ -133,52 +212,74 @@ export async function deleteRagDocument(payload: RagDeletePayload | { id?: strin
 
   for (const id of ids) {
     try {
-      const response = await api.post(`${RAG_ADMIN_ENDPOINTS.DELETE_BASE}/${encodeURIComponent(id)}/delete`, {
-        confirmation_phrase: 'CONFIRMADO',
-        hard_delete: payload.delete_chunks ?? true,
-        delete_chunks: payload.delete_chunks ?? true,
-      });
+      await api.post(`${RAG_ADMIN_ENDPOINTS.DELETE_BASE}/${encodeURIComponent(id)}/delete`, payload);
       deleted.push(id);
     } catch (error) {
-      failed.push({ id, error: normalizeError(error).message });
+      failed.push({
+        id,
+        error: normalizeError(error).message,
+      });
     }
   }
 
-  return { deleted, failed };
+  return {
+    deleted,
+    failed,
+  };
 }
 
 export async function clearRagDatabase(confirm?: boolean): Promise<RagClearResponse> {
-  try {
-    const response = await api.post(RAG_ADMIN_ENDPOINTS.CLEAR, {
-      confirmation_phrase: confirm === true ? 'CONFIRMADO' : 'SIMULACAO',
-      dry_run: confirm !== true,
-    });
-    const data = extractBody(response);
-    const count = getFirstDefined(data.total_documents_deleted, data.count, data.affected_count, data.deleted_count, data.total) || 0;
-    return { cleared: confirm === true, count };
-  } catch (error) {
-    throw normalizeError(error);
-  }
+  const body = {
+    confirmation_phrase: confirm ? 'CONFIRMADO' : undefined,
+    dry_run: !confirm,
+  };
+
+  const response = await api.post(RAG_ADMIN_ENDPOINTS.CLEAR, body);
+  const resBody = extractBody(response);
+  const cleared = !!getFirstDefined(resBody?.success, resBody?.cleared, true);
+  const count = getFirstDefined<number>(
+    resBody?.total_documents_deleted,
+    resBody?.count,
+    resBody?.affected_count,
+    resBody?.deleted_count,
+    resBody?.total,
+    0
+  );
+
+  return {
+    cleared,
+    count,
+  };
 }
 
-export async function reindexRagDatabase(payload?: RagReindexPayload): Promise<RagReindexResponse> {
-  try {
-    const response = await api.post(RAG_ADMIN_ENDPOINTS.REINDEX, {
-      confirmation_phrase: 'CONFIRMADO',
-      original_file_ids: [],
-    });
-    const data = extractBody(response);
-    if (typeof data === 'object' && data !== null) {
-      const reindexed = data.status === 'completed';
-      const count = data.processed_files ?? 0;
-      const status = data.status === 'completed' ? 'completed' : 'in_progress';
-      const jobId = data.jobId;
-      return { reindexed, count, status, jobId };
-    }
-    return { reindexed: false, count: 0, status: 'in_progress' };
-  } catch (error) {
-    throw normalizeError(error);
-  }
+export async function reindexRagDatabase(
+  payload?: RagReindexPayload
+): Promise<RagReindexResponse> {
+  const body = {
+    confirmation_phrase: 'CONFIRMADO',
+    original_file_ids: [],
+  };
+
+  const response = await api.post(RAG_ADMIN_ENDPOINTS.REINDEX, body);
+  const resBody = extractBody(response);
+  const reindexed = !!getFirstDefined(resBody?.success, resBody?.reindexed, false);
+  const count = getFirstDefined<number>(
+    resBody?.count,
+    resBody?.reindexed_count,
+    resBody?.total,
+    0
+  );
+  const status = getFirstDefined<'completed' | 'in_progress'>(
+    resBody?.status
+  ) || 'completed';
+  const jobId = resBody?.jobId;
+
+  return {
+    reindexed,
+    count,
+    status,
+    ...(jobId && { jobId }),
+  };
 }
 
 export async function getRagOperationStatus(jobId: string): Promise<RagOperationStatusResponse> {
@@ -192,6 +293,6 @@ export const ragAdminApi = {
   clearRagDatabase,
   reindexRagDatabase,
   getRagOperationStatus,
-};
+} as const;
 
 export default ragAdminApi;
