@@ -1,9 +1,8 @@
-// CAMINHO: frontend/app/main/hub/page.tsx
 'use client';
 
 import React from 'react';
 import Link from 'next/link';
-import { MessageSquareTextIcon, UploadCloudIcon, BarChart2Icon, UserIcon } from 'lucide-react';
+import { MessageSquareTextIcon, UploadCloudIcon, BarChart2Icon, UserIcon, VideoIcon } from 'lucide-react';
 import { useAuthStore } from '@/store/authStore';
 import { useRouter } from 'next/navigation';
 
@@ -35,9 +34,8 @@ export default function HubPage() {
   };
 
   return (
-    <div className="p-8">
-      <div className="flex justify-between items-center mb-4">
-        <div></div>
+    <div className="min-h-screen bg-black p-8">
+      <div className="flex justify-start items-center mb-4">
         <button
           onClick={handleLogout}
           className="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded"
@@ -45,7 +43,9 @@ export default function HubPage() {
           Sair
         </button>
       </div>
+
       <h1 className="text-4xl font-bold text-white mb-4">Bem-vindo, {user?.email}!</h1>
+
       <p className="text-text-secondary text-lg mb-8">
         Explore as funcionalidades do Dr. Tilápia, seu assistente de IA para piscicultura.
       </p>
@@ -81,6 +81,13 @@ export default function HubPage() {
             disabled
           />
         )}
+
+        <FeatureCard
+          icon={VideoIcon}
+          title="Biblioteca de Vídeos"
+          description="Acesse nossa galeria de vídeos instrutivos e tutoriais sobre piscicultura."
+          href="/main/videos"
+        />
 
         <FeatureCard
           icon={UserIcon}
