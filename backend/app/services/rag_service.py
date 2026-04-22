@@ -1,4 +1,5 @@
 # CAMINHO: backend/app/services/rag_service.py
+
 import uuid
 import logging
 from pathlib import Path
@@ -8,6 +9,7 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from app.database import supabase_admin
+from storage3.exceptions import StorageApiError
 
 class RAGService:
     def __init__(self):
@@ -24,21 +26,24 @@ class RAGService:
             raise FileNotFoundError(f"Arquivo não encontrado: {file_path}")
         if original_file_id is None:
             original_file_id = str(uuid.uuid4())
+        self.logger.info(f"Iniciando ingestão do PDF: {filename}")
         loader = PyPDFLoader(file_path)
         documents = loader.load()
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         chunks = text_splitter.split_documents(documents)
+        self.logger.info(f"Gerados {len(chunks)} chunks do PDF {filename}")
         if not chunks:
             raise ValueError("Nenhum chunk foi gerado do PDF.")
         storage_path = f"uploads/{original_file_id}/{filename}"
-        with open(file_path, "rb") as f:
-            self.supabase.storage.from_(self.storage_bucket).upload(storage_path, f)
+        self._upload_file_to_storage(file_path, storage_path, overwrite=cleanup_existing)
+        self.logger.info(f"PDF {filename} enviado para storage em {storage_path}")
         if cleanup_existing:
             await self._delete_existing_document_chunks(original_file_id)
         payloads = self._build_chunk_payloads(chunks, original_file_id, filename, self.storage_bucket, storage_path)
         await self._generate_embeddings_in_payloads(payloads)
         inserted_count = await self._insert_payload_batches(payloads)
         persisted_chunks = self._verify_persisted_chunks(original_file_id)
+        self.logger.info(f"Persistidos {persisted_chunks} chunks para {original_file_id}")
         if persisted_chunks <= 0:
             raise RuntimeError(f"Nenhum chunk foi persistido para original_file_id: {original_file_id}")
         return {
@@ -69,6 +74,7 @@ class RAGService:
                 "sources": []
             }
         prompt = f"""
+
 Você é um assistente especializado em piscicultura e tilápia. Responda à pergunta do usuário com base no contexto fornecido.
 
 Contexto:
@@ -93,8 +99,10 @@ Responda de forma clara e precisa.
 
     async def reindex_file_from_storage(self, file_info: Dict[str, Any]) -> Dict[str, Any]:
         original_file_id = file_info.get("original_file_id")
-        filename = file_info.get("original_file_name")
         storage_path = file_info.get("storage_path")
+        if not storage_path:
+            raise ValueError("storage_path ausente para reindexação")
+        filename = file_info.get("original_file_name") or Path(storage_path).name
         temp_dir = Path(gettempdir())
         temp_file = temp_dir / filename
         try:
@@ -192,5 +200,20 @@ Responda de forma clara e precisa.
 
     def _safe_content(self, doc):
         return doc.get("content", "").strip()
+
+    def _upload_file_to_storage(self, file_path: str, storage_path: str, overwrite: bool = False) -> None:
+        try:
+            bucket = self.supabase.storage.from_(self.storage_bucket)
+            with open(file_path, "rb") as f:
+                if overwrite and hasattr(bucket, 'update'):
+                    bucket.update(storage_path, f)
+                else:
+                    bucket.upload(storage_path, f)
+        except StorageApiError as e:
+            msg = str(e).lower()
+            if any(kw in msg for kw in ["row-level security", "policy", "unauthorized", "403"]):
+                raise RuntimeError("Falha de permissão no Supabase Storage. Verifique a SUPABASE_SERVICE_ROLE_KEY e as políticas do bucket 'rag-documents'.")
+            else:
+                raise RuntimeError(f"Falha no upload para o Supabase Storage: {str(e)}")
 
 rag_service = RAGService()
