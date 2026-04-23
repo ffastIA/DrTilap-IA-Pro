@@ -1,5 +1,3 @@
-# CAMINHO: backend/app/services/rag_service.py
-
 import uuid
 import logging
 from pathlib import Path
@@ -14,12 +12,22 @@ from storage3.exceptions import StorageApiError
 class RAGService:
     def __init__(self):
         self.embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-        self.llm = ChatOpenAI(model="gpt-4o", temperature=0)
+        self.llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
         self.supabase = supabase_admin
         self.storage_bucket = "rag-documents"
         self.embedding_batch_size = 20
         self.insert_batch_size = 20
         self.logger = logging.getLogger(__name__)
+
+    def _detect_language(self, text: str) -> str:
+        if not text or not text.strip():
+            return 'pt'
+        words = [w.strip('.,!?;:"\'()[]{}') for w in text.lower().split() if w.strip('.,!?;:"\'()[]{}')]
+        pt_words = {'o', 'a', 'de', 'do', 'da', 'em', 'um', 'uma', 'para', 'é', 'com', 'não', 'na', 'os', 'no', 'as', 'dos', 'que', 'por', 'mais', 'pelo', 'pela', 'sem', 'sobre', 'este', 'esta', 'foi', 'era', 'tem', 'ser'}
+        en_words = {'the', 'of', 'and', 'a', 'to', 'in', 'is', 'you', 'that', 'it', 'he', 'was', 'for', 'on', 'are', 'as', 'with', 'his', 'they', 'i', 'be', 'this', 'have', 'from', 'or', 'one', 'had', 'by', 'but', 'not', 'what', 'all', 'were', 'when', 'can', 'said', 'there', 'use', 'an', 'each'}
+        pt_score = sum(1 for w in words if w in pt_words)
+        en_score = sum(1 for w in words if w in en_words)
+        return 'pt' if pt_score > en_score else 'en'
 
     async def ingest_pdf(self, file_path: str, filename: str, original_file_id: Optional[str] = None, cleanup_existing: bool = False) -> Dict[str, Any]:
         if not Path(file_path).exists():
@@ -34,12 +42,15 @@ class RAGService:
         self.logger.info(f"Gerados {len(chunks)} chunks do PDF {filename}")
         if not chunks:
             raise ValueError("Nenhum chunk foi gerado do PDF.")
+        full_text = " ".join(doc.page_content for doc in documents)
+        document_language = self._detect_language(full_text)
+        self.logger.info(f"Idioma detectado do documento {filename}: {document_language}")
         storage_path = f"uploads/{original_file_id}/{filename}"
         self._upload_file_to_storage(file_path, storage_path, overwrite=cleanup_existing)
         self.logger.info(f"PDF {filename} enviado para storage em {storage_path}")
         if cleanup_existing:
             await self._delete_existing_document_chunks(original_file_id)
-        payloads = self._build_chunk_payloads(chunks, original_file_id, filename, self.storage_bucket, storage_path)
+        payloads = self._build_chunk_payloads(chunks, original_file_id, filename, self.storage_bucket, storage_path, document_language)
         await self._generate_embeddings_in_payloads(payloads)
         inserted_count = await self._insert_payload_batches(payloads)
         persisted_chunks = self._verify_persisted_chunks(original_file_id)
@@ -53,18 +64,44 @@ class RAGService:
             "chunks_criados": len(chunks),
             "persisted_chunks": persisted_chunks,
             "storage_bucket": self.storage_bucket,
-            "storage_path": storage_path
+            "storage_path": storage_path,
+            "source_language": document_language,
+            "multilingual_ready": True
         }
 
     async def get_answer(self, question: str, chat_history: List[Tuple[str, str]]) -> Dict[str, Any]:
+        question_language = self._detect_language(question)
         query_embedding = self.embeddings.embed_query(question)
-        response = self.supabase.rpc("match_documents", {
+        response_orig = self.supabase.rpc("match_documents", {
             "query_embedding": query_embedding,
             "match_count": 5,
             "similarity_threshold": 0.7
         }).execute()
-        docs = response.data or []
-        normalized_docs = [self._normalize_match_doc(doc) for doc in docs]
+        docs_orig = response_orig.data or []
+        normalized_docs = []
+        if question_language == 'pt':
+            eng_prompt = f'''Traduza esta pergunta para inglês de forma precisa, concisa e otimizada para busca semântica:\n\n"{question}"\n\nResponda APENAS com a tradução em inglês, sem explicações adicionais.'''
+            eng_query = self.llm.invoke(eng_prompt).content.strip()
+            self.logger.info(f"Query auxiliar em inglês gerada: {eng_query}")
+            eng_embedding = self.embeddings.embed_query(eng_query)
+            response_eng = self.supabase.rpc("match_documents", {
+                "query_embedding": eng_embedding,
+                "match_count": 5,
+                "similarity_threshold": 0.7
+            }).execute()
+            docs_eng = response_eng.data or []
+            all_docs = docs_orig + docs_eng
+            seen = set()
+            unique_docs = []
+            for doc in all_docs:
+                key = f"{doc.get('original_file_id', '')}_{doc.get('metadata', {{}}).get('page', 0)}"
+                if key not in seen:
+                    seen.add(key)
+                    unique_docs.append(doc)
+            unique_docs.sort(key=lambda d: d.get('similarity', 0.0), reverse=True)
+            normalized_docs = [self._normalize_match_doc(doc) for doc in unique_docs[:5]]
+        else:
+            normalized_docs = [self._normalize_match_doc(doc) for doc in docs_orig]
         if not any(doc.get('content') for doc in normalized_docs):
             normalized_docs = await self._best_effort_fetch_recent_chunks(limit=5)
         context = self._build_context_from_docs(normalized_docs)
@@ -75,9 +112,9 @@ class RAGService:
             }
         prompt = f"""
 
-Você é um assistente especializado em piscicultura e tilápia. Responda à pergunta do usuário com base no contexto fornecido.
+Você é um assistente especializado em piscicultura e tilápia. Responda SEMPRE em português brasileiro, de forma clara e precisa, com base no contexto fornecido.
 
-Contexto:
+Contexto (pode conter trechos em inglês ou português):
 
 {context}
 
@@ -115,12 +152,21 @@ Responda de forma clara e precisa.
             if temp_file.exists():
                 temp_file.unlink()
 
-    def _build_chunk_payloads(self, chunks, original_file_id, original_file_name, storage_bucket, storage_path):
+    def _build_chunk_payloads(self, chunks, original_file_id, original_file_name, storage_bucket, storage_path, document_language: str):
         payloads = []
         for chunk in chunks:
+            source_language = self._detect_language(chunk.page_content)
+            chunk_language = source_language
+            metadata = dict(chunk.metadata)
+            metadata.update({
+                "source_language": source_language,
+                "document_language": document_language,
+                "chunk_language": chunk_language,
+                "translation_strategy": "answer_in_ptbr"
+            })
             payload = {
                 "content": chunk.page_content,
-                "metadata": chunk.metadata,
+                "metadata": metadata,
                 "original_file_id": original_file_id,
                 "original_file_name": original_file_name,
                 "storage_bucket": storage_bucket,
@@ -172,7 +218,8 @@ Responda de forma clara e precisa.
             "content": doc.get("content", ""),
             "metadata": doc.get("metadata", {}),
             "original_file_name": doc.get("original_file_name", ""),
-            "original_file_id": doc.get("original_file_id", "")
+            "original_file_id": doc.get("original_file_id", ""),
+            "similarity": doc.get("similarity", 0.0)
         }
 
     def _build_context_from_docs(self, docs):
@@ -181,11 +228,14 @@ Responda de forma clara e precisa.
             content = doc.get("content", "").strip()
             if content:
                 file_name = doc.get("original_file_name", "Arquivo desconhecido")
-                page = self._safe_page_from_metadata(doc.get("metadata", {}))
-                if page:
-                    context_parts.append(f"Arquivo: {file_name}, Página: {page}\n{content}")
+                metadata = doc.get("metadata", {})
+                page = self._safe_page_from_metadata(metadata)
+                lang_info = metadata.get("chunk_language")
+                lang_str = f", Idioma: {lang_info.upper()}" if lang_info else ""
+                if page is not None:
+                    context_parts.append(f"Arquivo: {file_name}, Página: {page}{lang_str}\n{content}")
                 else:
-                    context_parts.append(f"Arquivo: {file_name}\n{content}")
+                    context_parts.append(f"Arquivo: {file_name}{lang_str}\n{content}")
         return "\n\n".join(context_parts)
 
     async def _delete_existing_document_chunks(self, original_file_id):

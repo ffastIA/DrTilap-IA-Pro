@@ -1,4 +1,3 @@
-# CAMINHO: backend/app/main.py
 import logging
 import os
 import tempfile
@@ -68,7 +67,6 @@ async def login(data: LoginRequest):
         user_id = auth_user.id
         email = auth_user.email
         role = None
-        # Ordem do role
         public_user = _load_public_user_profile(user_id=user_id, email=None)
         if public_user:
             role = public_user.get('role')
