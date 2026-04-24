@@ -41,7 +41,6 @@ class ChatRequest(BaseModel):
     history: List[List[str]] = []
 
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -49,7 +48,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 logger = logging.getLogger(__name__)
 
 @app.post("/auth/login", response_model=LoginResponse)
@@ -72,8 +70,8 @@ async def login(data: LoginRequest):
             role = public_user.get('role')
         if not role:
             public_user = _load_public_user_profile(user_id=None, email=email)
-            if public_user:
-                role = public_user.get('role')
+        if public_user:
+            role = public_user.get('role')
         if not role:
             role = _extract_role_from_auth_user(auth_user)
         if not role:
@@ -164,7 +162,12 @@ async def get_vector_file_diagnosis(original_file_id: str):
 async def delete_vector_file(original_file_id: str, request: DeleteFileRequest):
     try:
         delete_chunks = request.delete_chunks if request.delete_chunks is not None else request.hard_delete
-        result = vector_admin_service.delete_file(original_file_id, delete_chunks)
+        result = vector_admin_service.delete_file(
+            original_file_id,
+            request.confirmation_phrase,
+            request.reason,
+            delete_chunks,
+        )
         normalized = _normalize_delete_response(original_file_id, result)
         return DeleteFileResponse(**normalized)
     except Exception as e:
@@ -174,8 +177,10 @@ async def delete_vector_file(original_file_id: str, request: DeleteFileRequest):
 @app.post("/admin/vector-base/cleanup", response_model=CleanupVectorBaseResponse)
 async def cleanup_vector_base(request: CleanupVectorBaseRequest):
     try:
-        dry_run = request.dry_run if request.dry_run is not None else (request.confirmation_phrase == "SIMULACAO")
-        result = vector_admin_service.cleanup(dry_run)
+        if request.dry_run is True and request.confirmation_phrase == "SIMULACAO":
+            result = vector_admin_service.cleanup(True)
+        else:
+            result = vector_admin_service.cleanup(request.confirmation_phrase)
         normalized = _normalize_cleanup_response(result)
         return CleanupVectorBaseResponse(**normalized)
     except Exception as e:
