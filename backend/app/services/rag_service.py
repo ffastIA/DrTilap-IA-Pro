@@ -1,5 +1,6 @@
 from typing import TypedDict, List, Optional, Sequence, Any
 import uuid
+import inspect
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -123,19 +124,41 @@ class RAGService:
         return 'respond'
 
     async def ingest_pdf(self, file_path: str, filename: str) -> int:
+
         loader = PyPDFLoader(file_path)
         docs = loader.load()
-        splits = self.text_splitter.split_documents(docs)
+
         file_id = str(uuid.uuid4())
-        for split in splits:
-            split.metadata.update({
-                'original_file_id': file_id,
-                'original_file_name': filename,
-                'storage_bucket': 'pdf_storage',
-                'storage_path': filename,
-            })
+        for doc in docs:
+            doc.metadata['file_id'] = file_id
+
+        splits = self.text_splitter.split_documents(docs)
+
         self.vectorstore.add_documents(splits)
+
+        storage_bucket = 'pdf_storage'
+        storage_path = filename
+
+        query = (supabase_admin
+                 .table('documents')
+                 .update({
+            'original_file_id': file_id,
+            'original_file_name': filename,
+            'storage_bucket': storage_bucket,
+            'storage_path': storage_path
+        })
+                 .filter('metadata->>file_id', 'eq', file_id)
+                 )
+
+        response = query.execute()
+        if inspect.isawaitable(response):
+            response = await response
+
+        if not response.data:
+            raise RuntimeError('No documents updated')
+
         return len(splits)
+
 
     async def get_answer(self, question: str, chat_history: List[dict]) -> str:
         docs = self.vectorstore.similarity_search(question, k=5)
