@@ -1,62 +1,125 @@
+from dotenv import load_dotenv
 import os
-import sys
-
-# 1. Localiza a pasta 'backend' de forma absoluta
-# Isso evita problemas com o OneDrive e caminhos relativos no Windows
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# 2. Injeta o caminho no sys.path para o Python "enxergar" a pasta app
-if BASE_DIR not in sys.path:
-    sys.path.insert(0, BASE_DIR)
-
-try:
-    # Importação direta (agora o Python sabe que 'app' está na raiz do sys.path)
-    from app.database import supabase
-    from app.auth.auth_service import get_password_hash
+from supabase import create_client, Client
+import argparse
 
 
-    def main():
-        print("\n" + "=" * 50)
-        print("   DR. TILÁPIA - CONFIGURAÇÃO DE ACESSO ADMIN")
-        print("=" * 50)
+def get_supabase_client() -> Client:
+    load_dotenv()
+    supabase_url = os.environ["SUPABASE_URL"]
+    supabase_service_key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+    return create_client(supabase_url, supabase_service_key)
 
-        email = input("📧 E-mail do Administrador: ").strip()
-        senha = input("🔑 Senha do Administrador: ").strip()
 
-        if not email or not senha:
-            print("❌ Erro: Campos obrigatórios vazios.")
-            return
-
-        print("\n⏳ Gerando Hash e conectando ao Supabase...")
-
+def iter_auth_users(admin):
+    page = 1
+    max_per_page = 100
+    while True:
+        users_resp = None
         try:
-            # Gerando o hash usando sua função do auth_service
-            senha_hash = get_password_hash(senha)
+            # Try list_users with pagination params
+            try:
+                users_resp = admin.list_users(page=page, per_page=max_per_page)
+            except TypeError:
+                try:
+                    users_resp = admin.list_users(page=page, perPage=max_per_page)
+                except TypeError:
+                    pass
+            if users_resp is None and page == 1:
+                # Fallback to no params for first page
+                try:
+                    users_resp = admin.list_users()
+                except TypeError:
+                    pass
+            if users_resp is None:
+                break
 
-            # Inserindo na tabela 'users'
-            # IMPORTANTE: Verifique se as colunas no Supabase são exatamente estas
-            dados = {
-                "email": email,
-                "hashed_password": senha_hash,
-                "role": "admin"
-            }
+            # Extract users robustly
+            users = []
+            if hasattr(users_resp, 'users'):
+                users = getattr(users_resp, 'users', [])
+            elif hasattr(users_resp, 'data'):
+                data = getattr(users_resp, 'data', None)
+                if isinstance(data, list):
+                    users = data
+                elif hasattr(data, 'users'):
+                    users = getattr(data, 'users', [])
+            elif isinstance(users_resp, list):
+                users = users_resp
 
-            response = supabase.table("users").insert(dados).execute()
+            for user in users:
+                if hasattr(user, 'id') and hasattr(user, 'email'):
+                    yield user
 
-            if response.data:
-                print(f"\n✅ SUCESSO! Usuário '{email}' criado.")
-                print("🚀 Agora você pode logar no Frontend (Porta 3000).")
-            else:
-                print("\n❌ Erro: O banco não retornou confirmação.")
-
-        except Exception as e:
-            print(f"\n❌ Erro na operação: {e}")
+            if len(users) < max_per_page:
+                break
+            page += 1
+        except Exception:
+            break
 
 
-    if __name__ == "__main__":
-        main()
+def find_user_by_email(client, email):
+    admin = client.auth.admin
+    for user in iter_auth_users(admin):
+        if user.email == email:
+            return user
+    return None
 
-except ImportError as e:
-    print(f"\n❌ ERRO DE IMPORTAÇÃO: {e}")
-    print(f"DEBUG: Verifique se existe o arquivo: {os.path.join(BASE_DIR, 'app', 'database.py')}")
-    print(f"DEBUG: Verifique se existe o arquivo: {os.path.join(BASE_DIR, 'app', '__init__.py')}")
+
+def create_auth_user(client, email, password, name=None):
+    admin = client.auth.admin
+    data = {
+        'email': email,
+        'password': password
+    }
+    if name:
+        data['user_metadata'] = {'name': name}
+    resp = admin.create_user(**data)
+    # Extract user robustly
+    user = None
+    if hasattr(resp, 'user') and resp.user:
+        user = resp.user
+    elif hasattr(resp, 'data') and resp.data and hasattr(resp.data, 'user') and resp.data.user:
+        user = resp.data.user
+    if not user or not hasattr(user, 'id'):
+        raise ValueError('Falha ao extrair usuário criado')
+    return user
+
+
+def upsert_user_profile(client, user, role):
+    data = {
+        'id': user.id,
+        'email': user.email,
+        'role': role
+    }
+    client.table('users').upsert(data, on_conflict='id').execute()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Criar ou atualizar admin no Supabase')
+    parser.add_argument('--email', required=True, help='Email do admin')
+    parser.add_argument('--password', required=True, help='Senha do admin')
+    parser.add_argument('--name', help='Nome opcional do admin')
+    parser.add_argument('--role', default='admin', help='Role do usuário (default: admin)')
+    args = parser.parse_args()
+
+    try:
+        client = get_supabase_client()
+        print('Cliente Supabase carregado.')
+
+        existing_user = find_user_by_email(client, args.email)
+        if existing_user:
+            print(f'Usuário encontrado: {existing_user.email} (ID: {existing_user.id})')
+            user = existing_user
+        else:
+            user = create_auth_user(client, args.email, args.password, args.name)
+            print(f'Usuário criado: {user.email} (ID: {user.id})')
+
+        upsert_user_profile(client, user, args.role)
+        print(f'Perfil upsertado em public.users com role: {args.role}')
+    except Exception as e:
+        print(f'Erro: {e}')
+        exit(1)
+
+if __name__ == '__main__':
+    main()

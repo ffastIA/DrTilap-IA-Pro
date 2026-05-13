@@ -1,4 +1,5 @@
 import logging
+import time
 import os
 import tempfile
 from fastapi import FastAPI, HTTPException, UploadFile, File
@@ -8,6 +9,7 @@ from typing import List, Optional, Dict, Any
 from app.database import supabase_admin
 from app.services.vector_admin_service import vector_admin_service
 from app.services.rag_service import rag_service
+from app.auth.auth_service import auth_service
 from app.vector_admin_schemas import (
     VectorFileSummary,
     VectorFileDetail,
@@ -21,6 +23,11 @@ from app.vector_admin_schemas import (
     ReindexFileRequest,
     ReindexFileResponse,
 )
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', force=True)
+logging.getLogger("AuthService").setLevel(logging.INFO)
+logging.getLogger("uvicorn").setLevel(logging.INFO)
+logging.getLogger("uvicorn.error").setLevel(logging.INFO)
 
 class LoginRequest(BaseModel):
     email: str
@@ -52,36 +59,30 @@ logger = logging.getLogger(__name__)
 
 @app.post("/auth/login", response_model=LoginResponse)
 async def login(data: LoginRequest):
+    start_time = time.perf_counter()
+    logger.info("[main.login] início da requisição para email=%s", data.email)
     try:
-        auth_response = supabase_admin.auth.sign_in_with_password({
-            "email": data.email,
-            "password": data.password
-        })
-        if not auth_response.user or not auth_response.session:
+        logger.info("[main.login] chamando auth_service.login para email=%s", data.email)
+        result = await auth_service.login(data.email, data.password)
+        logger.info("[main.login] auth_service.login retornou para email=%s", data.email)
+        if result is None:
+            logger.warning("[main.login] auth_service retornou None para email=%s", data.email)
             raise HTTPException(status_code=401, detail="Invalid credentials")
-        session = auth_response.session
-        access_token = session.access_token
-        auth_user = auth_response.user
-        user_id = auth_user.id
-        email = auth_user.email
-        role = None
-        public_user = _load_public_user_profile(user_id=user_id, email=None)
-        if public_user:
-            role = public_user.get('role')
-        if not role:
-            public_user = _load_public_user_profile(user_id=None, email=email)
-        if public_user:
-            role = public_user.get('role')
-        if not role:
-            role = _extract_role_from_auth_user(auth_user)
-        if not role:
-            role = 'user'
-        role = _normalize_role(role)
-        user_response = LoginUserResponse(id=user_id, email=email, role=role)
-        return LoginResponse(access_token=access_token, token_type="bearer", user=user_response)
-    except Exception as e:
+        access_token = result['access_token']
+        token_type = result['token_type']
+        user = result['user']
+        logger.info("[main.login] montando resposta para user_id=%s role=%s", user['id'], user['role'])
+        user_response = LoginUserResponse(id=user['id'], email=user['email'], role=user['role'])
+        elapsed_seconds = time.perf_counter() - start_time
+        logger.info("[main.login] login concluído para email=%s em %.3fs", data.email, elapsed_seconds)
+        return LoginResponse(access_token=access_token, token_type=token_type, user=user_response)
+    except HTTPException:
+        logger.exception("[main.login] HTTPException durante login para email=%s", data.email)
+        raise
+    except Exception:
+        logger.exception("[main.login] exceção inesperada para email=%s", data.email)
         logger.exception("Erro no login")
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(status_code=500, detail="Erro interno do servidor")
 
 @app.post("/consultoria/chat")
 async def chat(data: ChatRequest):
