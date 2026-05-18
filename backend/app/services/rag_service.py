@@ -1,7 +1,7 @@
 import os
 import json
 import hashlib
-from typing import TypedDict, Dict, Any, List
+from typing import TypedDict, Dict, Any, List, Literal
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -16,6 +16,9 @@ class State(TypedDict):
     question: str
     context: str
     answer: str
+    evaluation: str
+    retry_count: int
+    language: str
 
 
 class RAGService:
@@ -51,15 +54,23 @@ class RAGService:
 
     def get_answer(self, question: str) -> str:
         """Ponto de entrada: invoca grafo com pergunta."""
-        input_state = {"question": question}
+        lang = self._detect_question_language(question)
+        input_state = {
+            "question": question,
+            "context": "",
+            "answer": "",
+            "evaluation": "",
+            "retry_count": 0,
+            "language": lang,
+        }
         result = self.graph.invoke(input_state)
         return result["answer"]
 
     def _build_graph(self) -> Any:
-        """Grafo com retrieve -> generate."""
+        """Grafo com retrieve -> generate -> evaluate -> (conditional retry ou END)."""
         workflow = StateGraph(State)
 
-        def retrieve(state: State) -> Dict[str, str]:
+        def retrieve(state: State) -> Dict[str, Any]:
             """Nó: recupera docs e monta context."""
             docs = self._retrieve_docs_via_rpc(state["question"], k=20)
             context = "\n\n".join(doc.page_content for doc in docs)
@@ -67,8 +78,13 @@ class RAGService:
 
         def generate(state: State) -> Dict[str, str]:
             """Nó: gera resposta com prompt AGRESSIVO para números."""
+            lang = state["language"]
+            lang_instruction = "Responda COMPLETAMENTE em português (pt-BR)." if lang == "pt-BR" else "Respond COMPLETELY in English."
+
             prompt = ChatPromptTemplate.from_template(
-                """You are an expert extracting NUMBERS and VALUES from scientific documents. Extract DATA with ACTUAL NUMERIC VALUES paired with headers.
+                f"""You are an expert extracting NUMBERS and VALUES from scientific documents. Extract DATA with ACTUAL NUMERIC VALUES paired with headers.
+
+{lang_instruction}
 
 **MISSION:** Extract DATA, METHODOLOGY, INTERPRETATION, LIMITATIONS.
 
@@ -110,16 +126,12 @@ LIMITATIONS:
      FCR: 2.1
      Survival: 95% (p<0.05)
 
-5. **MALFORMED CONTEXT:**
-   - Ignore garbage symbols, breaks, tabs, case variations
-   - Extract fragments even if scattered
-
-6. **METHODOLOGY EXTRACTION:**
+5. **METHODOLOGY EXTRACTION:**
    - Look for: "Materials and Methods", "Method", "Procedure", "Statistical analysis", "Design"
    - Extract procedural descriptions, study parameters, sample characteristics
    - Even if fragmented, pair descriptions with numbers (n=, sample size, duration, etc.)
 
-7. **INTERPRETATION EXTRACTION:**
+6. **INTERPRETATION EXTRACTION:**
    - Look for: "Results", "Discussion", "Findings", "Observed", "Showed", "Demonstrated"
    - Extract what results mean, comparisons between treatments, statistical significance
    - Link numbers to their interpretation (e.g., "Weight gain was higher (p<0.05)" not just the p-value)
@@ -127,24 +139,75 @@ LIMITATIONS:
 ---
 
 **CONTEXT:**
-{context}
+{{context}}
 
 **QUESTION:**
-{question}
+{{question}}
 
 ---
 
 **EXTRACT - PRIORITIZE NUMBERS AND PAIR WITH HEADERS. EXTRACT ALL 4 SECTIONS IF DATA EXISTS. FOLLOW FORMAT. NEVER HEADERS WITHOUT NUMBERS.**"""
             )
             chain = prompt | self.llm
-            response = chain.invoke(state)
+            response = chain.invoke({
+                "context": state["context"],
+                "question": state["question"]
+            })
             return {"answer": response.content}
+
+        def evaluate(state: State) -> Dict[str, str]:
+            """Nó: avalia qualidade da resposta."""
+            answer = state["answer"]
+            lang = state["language"]
+
+            # Critérios de qualidade
+            has_data = "DATA:" in answer and "Empty section" not in answer.split("DATA:")[1].split("\n")[0]
+            has_content = len(answer) > 200
+            sections_with_content = sum(1 for section in ["DATA:", "METHODOLOGY:", "INTERPRETATION:"] if
+                                        section in answer and "Empty section" not in
+                                        answer.split(section)[1].split("\n")[0])
+            has_numbers = any(char.isdigit() for char in answer)
+
+            # Qualidade considerada ALTA se tem dados E números E pelo menos 2 seções preenchidas
+            quality = "HIGH_QUALITY" if (
+                        has_data and has_numbers and sections_with_content >= 2 and has_content) else "LOW_QUALITY"
+
+            return {"evaluation": quality}
+
+        def should_retry(state: State) -> Literal["generate", "end"]:
+            """Condicional: retry ou END."""
+            if state["evaluation"] == "LOW_QUALITY" and state["retry_count"] < 2:
+                return "retrieve_retry"
+            else:
+                return "end"
+
+        def retrieve_retry(state: State) -> Dict[str, Any]:
+            """Nó: retry retrieve com query reescrita."""
+            # Aumentar k para próxima tentativa
+            k = 25 if state["retry_count"] == 0 else 30
+            docs = self._retrieve_docs_via_rpc(state["question"], k=k)
+            context = "\n\n".join(doc.page_content for doc in docs)
+            retry_count = state["retry_count"] + 1
+            return {"context": context, "retry_count": retry_count}
 
         workflow.add_node("retrieve", retrieve)
         workflow.add_node("generate", generate)
+        workflow.add_node("evaluate", evaluate)
+        workflow.add_node("retrieve_retry", retrieve_retry)
+
         workflow.set_entry_point("retrieve")
         workflow.add_edge("retrieve", "generate")
-        workflow.add_edge("generate", END)
+        workflow.add_edge("generate", "evaluate")
+        workflow.add_conditional_edges(
+            "evaluate",
+            should_retry,
+            {
+                "retrieve_retry": "retrieve_retry",
+                "end": END,
+            },
+        )
+        workflow.add_edge("retrieve_retry", "generate")
+
         return workflow.compile()
 
     def _embed_query(self, text: str) -> List[float]:
@@ -194,11 +257,11 @@ LIMITATIONS:
         """Detecção de idioma: pt-BR ou en."""
         q_lower = question.lower()
         pt_words = {'como', 'qual', 'quais', 'não', 'tilápia', 'restrição', 'alimentar', 'viveiro', 'crescimento',
-                    'alevinos'}
+                    'alevinos', 'qual', 'o que', 'por que'}
         en_words = {'what', 'how', 'which', 'feed', 'restriction', 'restricted', 'diet', 'under', 'growth',
-                    'fingerlings'}
+                    'fingerlings', 'why', 'describe'}
         pt_accents = any(c in 'áéíóúãõçÁÉÍÓÚÃÕÇ' for c in question)
-        pt_score = sum(1 for w in pt_words if w in q_lower) + (1 if pt_accents else 0)
+        pt_score = sum(1 for w in pt_words if w in q_lower) + (2 if pt_accents else 0)
         en_score = sum(1 for w in en_words if w in q_lower)
         return 'pt-BR' if pt_score >= en_score else 'en'
 
@@ -270,7 +333,7 @@ LIMITATIONS:
         return sorted(docs, key=rerank_key, reverse=True)
 
     def _retrieve_docs_via_rpc(self, question: str, k: int = 20) -> List[Document]:
-        """Recuperação via RPC com k=20."""
+        """Recuperação via RPC com k variável."""
         lang = self._detect_question_language(question)
         rewritten_question = self._rewrite_query(question, lang)
         query_vector = self._embed_query(rewritten_question)
