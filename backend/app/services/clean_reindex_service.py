@@ -1,5 +1,3 @@
-# backend/app/services/clean_reindex_service.py
-
 import os
 import time
 from typing import List, Optional, Dict, Any, Tuple
@@ -20,8 +18,9 @@ class CleanReindexService:
         self.vectorstore = SupabaseVectorStore(
             client=self.supabase_admin, embedding=self.embeddings, table_name="documents"
         )
-        self.default_chunk_size = 1000
-        self.default_chunk_overlap = 200
+        # OTIMIZAÇÃO CRÍTICA: Chunks maiores para preservar tabelas/seções inteiras
+        self.default_chunk_size = 4000  # Aumentado de 2500
+        self.default_chunk_overlap = 500  # Aumentado de 300
 
     def validate_reindex_input(
         self,
@@ -129,16 +128,19 @@ class CleanReindexService:
         return len(response.data) if response.data else 0
 
     def _load_and_clean_pages(self, file_path: str) -> Tuple[List[Document], List[Document]]:
-        # Carrega e limpa páginas do PDF - CORRIGIDO: List[Document] -> List[Document]
+        # Carrega e limpa páginas do PDF
         loader = PyPDFLoader(file_path)
         raw_docs = loader.load()  # List[Document]
         cleaned_docs = clean_loaded_pages(raw_docs)  # List[Document]
         return raw_docs, cleaned_docs
 
     def _build_splitter(self, chunk_size: int, chunk_overlap: int) -> RecursiveCharacterTextSplitter:
-        # Constrói splitter
+        # Constrói splitter com parâmetros otimizados
         return RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size, chunk_overlap=chunk_overlap
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            # Separadores preservam estrutura de seções antes de quebrar
+            separators=["\n\n", "\n", ". ", " ", ""]
         )
 
     def build_clean_splits(
@@ -163,14 +165,14 @@ class CleanReindexService:
         )
         for doc in filtered_chunks:
             doc.metadata["clean_reindex"] = True
-            doc.metadata["cleaning_version"] = "v1"
+            doc.metadata["cleaning_version"] = "v3"
             for key in ["original_file_name", "storage_bucket", "storage_path", "source"]:
                 if key in identification:
                     doc.metadata[key] = identification[key]
         return filtered_chunks
 
     def filter_low_value_chunks(self, docs: List[Document]) -> List[Document]:
-        # Filtra chunks de baixo valor - CORRIGIDO: Document -> str
+        # Filtra chunks de baixo valor
         filtered = []
         for doc in docs:
             content = doc.page_content.strip()
