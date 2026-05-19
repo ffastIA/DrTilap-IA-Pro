@@ -45,12 +45,18 @@ class RAGService:
         )
         self.graph = self._build_graph()
 
-    def ingest_pdf(self, file_path: str) -> None:
-        """Ingestão de PDF mantida inalterada."""
+    async def ingest_pdf(self, file_path: str) -> dict:
+        """Ingestão de PDF com retorno assíncrono."""
         loader = PyPDFLoader(file_path)
         docs = loader.load()
         splits = self.text_splitter.split_documents(docs)
         self.vectorstore.add_documents(splits)
+        return {
+            "status": "success",
+            "message": "PDF ingerido com sucesso",
+            "chunks": len(splits),
+            "file_path": file_path
+        }
 
     def get_answer(self, question: str) -> str:
         """Ponto de entrada: invoca grafo com pergunta."""

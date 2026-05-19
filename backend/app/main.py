@@ -1,3 +1,5 @@
+# backend/app/main.py
+
 import logging
 import time
 import os
@@ -87,9 +89,8 @@ async def login(data: LoginRequest):
 @app.post("/consultoria/chat")
 async def chat(data: ChatRequest):
     try:
-        formatted_history = [tuple(h) for h in data.history]
-        response = await rag_service.get_answer(data.message, formatted_history)
-        return response
+        response = rag_service.get_answer(data.message)
+        return {"answer": response, "sources": []}
     except HTTPException:
         raise
     except Exception as e:
@@ -108,7 +109,7 @@ async def upload_admin(file: UploadFile = File(...)):
             temp_path = temp_file.name
             content = await file.read()
             temp_file.write(content)
-        result = await rag_service.ingest_pdf(temp_path, file.filename)
+        result = await rag_service.ingest_pdf(temp_path)
         return result
     except HTTPException:
         raise
