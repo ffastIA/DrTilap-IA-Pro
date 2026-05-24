@@ -23,3 +23,9 @@ build/
 # IDE specific settings (Opcional, mas recomendado)
 .pdf
 .docx
+
+# Claude Code — configurações locais com credenciais (nunca commitar)
+.claude/settings.local.json
+
+# Segurança extra: ignorar qualquer settings.json dentro de .claude que contenha credenciais reais
+# O settings.json commitado só deve ter placeholders (sem senhas ou tokens)

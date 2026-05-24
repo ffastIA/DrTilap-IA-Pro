@@ -6,17 +6,20 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import SupabaseVectorStore
-import supabase
+# REFATORAÇÃO: Importar supabase_admin centralizado
+from app.database import supabase_admin
 from app.utils.pdf_cleaning import clean_loaded_pages, is_editorial_or_low_value, contains_scientific_signal
-
 
 class CleanReindexService:
     def __init__(self, openai_api_key: str, supabase_url: str, supabase_key: str):
         # Inicializa embeddings e vectorstore
         self.embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
-        self.supabase_admin = supabase.create_client(supabase_url, supabase_key)
+        # REFATORAÇÃO: Usar supabase_admin centralizado em vez de criar novo cliente
+        self.supabase_admin = supabase_admin
         self.vectorstore = SupabaseVectorStore(
-            client=self.supabase_admin, embedding=self.embeddings, table_name="documents"
+            client=self.supabase_admin,
+            embedding=self.embeddings,
+            table_name="documents"
         )
         # OTIMIZAÇÃO CRÍTICA: Chunks maiores para preservar tabelas/seções inteiras
         self.default_chunk_size = 4000  # Aumentado de 2500
@@ -36,15 +39,12 @@ class CleanReindexService:
         # Valida parâmetros de entrada
         if not os.path.exists(file_path):
             raise ValueError(f"Arquivo não encontrado: {file_path}")
-
         chunk_size = chunk_size or self.default_chunk_size
         chunk_overlap = chunk_overlap or self.default_chunk_overlap
-
         if chunk_size <= 0:
             raise ValueError("chunk_size deve ser maior que 0")
         if chunk_overlap < 0 or chunk_overlap >= chunk_size:
             raise ValueError("chunk_overlap deve ser >= 0 e < chunk_size")
-
         if not dry_run:
             id_payload, _ = self._resolve_identification_payload(
                 original_file_name, storage_bucket, storage_path, source
@@ -130,8 +130,8 @@ class CleanReindexService:
     def _load_and_clean_pages(self, file_path: str) -> Tuple[List[Document], List[Document]]:
         # Carrega e limpa páginas do PDF
         loader = PyPDFLoader(file_path)
-        raw_docs = loader.load()  # List[Document]
-        cleaned_docs = clean_loaded_pages(raw_docs)  # List[Document]
+        raw_docs = loader.load()
+        cleaned_docs = clean_loaded_pages(raw_docs)
         return raw_docs, cleaned_docs
 
     def _build_splitter(self, chunk_size: int, chunk_overlap: int) -> RecursiveCharacterTextSplitter:
@@ -158,7 +158,6 @@ class CleanReindexService:
         splitter = self._build_splitter(chunk_size, chunk_overlap)
         all_chunks = splitter.split_documents(cleaned_docs)
         filtered_chunks = self.filter_low_value_chunks(all_chunks)
-
         # Enriquecer metadata
         identification, _ = self._resolve_identification_payload(
             original_file_name, storage_bucket, storage_path, source
@@ -273,16 +272,13 @@ class CleanReindexService:
             )
             chunk_size = chunk_size or self.default_chunk_size
             chunk_overlap = chunk_overlap or self.default_chunk_overlap
-
             raw_docs, cleaned_docs = self._load_and_clean_pages(file_path)
             splitter = self._build_splitter(chunk_size, chunk_overlap)
             all_chunks = splitter.split_documents(cleaned_docs)
             filtered_chunks = self.filter_low_value_chunks(all_chunks)
-
             stats = self._compute_processing_stats(
                 len(raw_docs), len(cleaned_docs), len(all_chunks), len(filtered_chunks)
             )
-
             id_payload, id_strategy = self._resolve_identification_payload(
                 original_file_name, storage_bucket, storage_path, source
             )
@@ -296,10 +292,8 @@ class CleanReindexService:
                 if id_payload
                 else 0
             )
-
             duration = time.time() - start_time
             sample_previews = self._build_sample_previews(filtered_chunks)
-
             return self.build_operation_report(
                 success=True,
                 mode="preview",
@@ -354,7 +348,6 @@ class CleanReindexService:
                 chunk_size,
                 chunk_overlap,
             )
-
         start_time = time.time()
         try:
             self.validate_reindex_input(
@@ -369,19 +362,15 @@ class CleanReindexService:
             )
             chunk_size = chunk_size or self.default_chunk_size
             chunk_overlap = chunk_overlap or self.default_chunk_overlap
-
             raw_docs, cleaned_docs = self._load_and_clean_pages(file_path)
             splitter = self._build_splitter(chunk_size, chunk_overlap)
             all_chunks = splitter.split_documents(cleaned_docs)
             filtered_chunks = self.filter_low_value_chunks(all_chunks)
-
             if len(filtered_chunks) == 0:
                 raise ValueError("Nenhum chunk útil após filtragem")
-
             stats = self._compute_processing_stats(
                 len(raw_docs), len(cleaned_docs), len(all_chunks), len(filtered_chunks)
             )
-
             candidate_delete_count = self.count_existing_vectors_for_file(
                 original_file_name=original_file_name,
                 storage_bucket=storage_bucket,
@@ -395,15 +384,12 @@ class CleanReindexService:
                 source=source,
             )
             vectors_inserted = self.add_clean_documents(filtered_chunks)
-
             duration = time.time() - start_time
             sample_previews = self._build_sample_previews(filtered_chunks)
-
             notes = (
                 f"Reindexação concluída. "
                 f"Deletados: {vectors_deleted}, Inseridos: {vectors_inserted}."
             )
-
             return self.build_operation_report(
                 success=True,
                 mode="reindex",

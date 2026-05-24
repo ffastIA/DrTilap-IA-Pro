@@ -69,12 +69,18 @@ class VectorAdminRepository:
         source = metadata.get('source', '')
         title = metadata.get('title', '')
 
-        # Detect temporary path
+        # Fonte primária: campos explícitos no metadata JSON (mais confiável)
+        metadata_original_name = metadata.get('original_file_name', '')
+        metadata_original_id = metadata.get('original_file_id', '')
+
+        # Detect temporary path (fallback quando metadata não tem os campos)
         temp_indicators = ['Temp', 'tmp', 'AppData', 'Local']
         is_temp = any(indicator in source for indicator in temp_indicators)
 
-        # Determine original file name
-        if source:
+        # Determine original file name (metadata JSON tem prioridade)
+        if metadata_original_name:
+            original_file_name = metadata_original_name
+        elif source:
             basename = os.path.basename(source)
             if is_temp and title:
                 original_file_name = title
@@ -83,8 +89,11 @@ class VectorAdminRepository:
         else:
             original_file_name = 'unknown'
 
-        # Compute MD5 hash
-        original_file_id = hashlib.md5(original_file_name.encode('utf-8')).hexdigest()
+        # Compute MD5 hash (usa o do metadata se disponível, evita recomputação)
+        if metadata_original_id:
+            original_file_id = metadata_original_id
+        else:
+            original_file_id = hashlib.md5(original_file_name.encode('utf-8')).hexdigest()
 
         # Build result dictionary
         result = {
@@ -305,8 +314,15 @@ class VectorAdminRepository:
 
         file_summary = self.get_file(original_file_id)
 
-        response = supabase_admin.table('documents').delete().eq('original_file_id', original_file_id).execute()
-        documents_deleted = len(response.data or [])
+        # Coluna original_file_id é null (LangChain não a popula).
+        # Obtém os UUIDs reais dos chunks via get_file_chunks e apaga por ID.
+        chunk_data = self.get_file_chunks(original_file_id)
+        chunk_ids = [c['id'] for c in chunk_data.get('chunks', [])]
+        if chunk_ids:
+            response = supabase_admin.table('documents').delete().in_('id', chunk_ids).execute()
+            documents_deleted = len(response.data or [])
+        else:
+            documents_deleted = 0
 
         ingestion_logs_deleted = self._best_effort_delete_ingestion_logs(original_file_id)
 

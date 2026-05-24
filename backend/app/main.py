@@ -1,5 +1,3 @@
-# backend/app/main.py
-
 import logging
 import time
 import os
@@ -12,6 +10,7 @@ from app.database import supabase_admin
 from app.services.vector_admin_service import vector_admin_service
 from app.services.rag_service import rag_service
 from app.auth.auth_service import auth_service
+
 from app.vector_admin_schemas import (
     VectorFileSummary,
     VectorFileDetail,
@@ -57,6 +56,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 logger = logging.getLogger(__name__)
 
 @app.post("/auth/login", response_model=LoginResponse)
@@ -89,7 +89,7 @@ async def login(data: LoginRequest):
 @app.post("/consultoria/chat")
 async def chat(data: ChatRequest):
     try:
-        response = rag_service.get_answer(data.message)
+        response = rag_service.get_answer(data.message, data.history)
         return {"answer": response, "sources": []}
     except HTTPException:
         raise
@@ -97,10 +97,13 @@ async def chat(data: ChatRequest):
         logger.exception("Erro no chat")
         raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
 
+# ========== ROTAS ADMIN (SEM AUTENTICAÇÃO) ==========
+
 @app.post("/admin/upload")
 async def upload_admin(file: UploadFile = File(...)):
     temp_path = None
     try:
+        logger.info(f"[upload_admin] Iniciando upload para filename={file.filename}")
         if not file.filename:
             raise HTTPException(status_code=400, detail="Arquivo inválido")
         if not file.filename.lower().endswith('.pdf'):
@@ -109,12 +112,16 @@ async def upload_admin(file: UploadFile = File(...)):
             temp_path = temp_file.name
             content = await file.read()
             temp_file.write(content)
-        result = await rag_service.ingest_pdf(temp_path)
+        result = await rag_service.ingest_pdf(temp_path, file.filename)
+        logger.info(f"[upload_admin] Upload concluído: {result.get('status')}")
+        if result.get('status') == 'already_exists':
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=409, content=result)
         return result
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Erro no upload administrativo")
+        logger.exception(f"[upload_admin] Erro no upload")
         raise HTTPException(status_code=500, detail=f"Erro no upload: {str(e)}")
     finally:
         if temp_path and os.path.exists(temp_path):
@@ -123,62 +130,69 @@ async def upload_admin(file: UploadFile = File(...)):
 @app.get("/admin/vector-base/files", response_model=List[VectorFileSummary])
 async def get_vector_files():
     try:
+        logger.info(f"[get_vector_files] Listando arquivos")
         return vector_admin_service.get_files()
     except Exception as e:
-        logger.exception("Erro ao listar arquivos vetoriais")
+        logger.exception(f"[get_vector_files] Erro")
         raise HTTPException(status_code=500, detail=f"Erro ao listar arquivos: {str(e)}")
 
 @app.get("/admin/vector-base/files/{original_file_id}", response_model=VectorFileDetail)
 async def get_vector_file(original_file_id: str):
     try:
+        logger.info(f"[get_vector_file] Obtendo arquivo {original_file_id}")
         return vector_admin_service.get_file(original_file_id)
     except Exception as e:
-        logger.exception("Erro ao obter arquivo vetorial")
+        logger.exception(f"[get_vector_file] Erro")
         raise HTTPException(status_code=500, detail=f"Erro ao obter arquivo: {str(e)}")
 
 @app.get("/admin/vector-base/files/{original_file_id}/chunks", response_model=VectorChunksResponse)
 async def get_vector_file_chunks(original_file_id: str):
     try:
+        logger.info(f"[get_vector_file_chunks] Obtendo chunks de {original_file_id}")
         return vector_admin_service.get_file_chunks(original_file_id)
     except Exception as e:
-        logger.exception("Erro ao obter chunks do arquivo vetorial")
+        logger.exception(f"[get_vector_file_chunks] Erro")
         raise HTTPException(status_code=500, detail=f"Erro ao obter chunks: {str(e)}")
 
 @app.get("/admin/vector-base/files/{original_file_id}/content", response_model=RecoverFileContentResponse)
 async def get_vector_file_content(original_file_id: str):
     try:
+        logger.info(f"[get_vector_file_content] Recuperando conteúdo de {original_file_id}")
         return vector_admin_service.get_file_content(original_file_id)
     except Exception as e:
-        logger.exception("Erro ao recuperar conteúdo do arquivo vetorial")
+        logger.exception(f"[get_vector_file_content] Erro")
         raise HTTPException(status_code=500, detail=f"Erro ao recuperar conteúdo: {str(e)}")
 
 @app.get("/admin/vector-base/files/{original_file_id}/diagnosis", response_model=RecoveryDiagnosisResponse)
 async def get_vector_file_diagnosis(original_file_id: str):
     try:
+        logger.info(f"[get_vector_file_diagnosis] Diagnosticando {original_file_id}")
         return vector_admin_service.get_file_diagnosis(original_file_id)
     except Exception as e:
-        logger.exception("Erro ao obter diagnóstico do arquivo vetorial")
+        logger.exception(f"[get_vector_file_diagnosis] Erro")
         raise HTTPException(status_code=500, detail=f"Erro ao obter diagnóstico: {str(e)}")
 
 @app.post("/admin/vector-base/files/{original_file_id}/delete", response_model=DeleteFileResponse)
 async def delete_vector_file(original_file_id: str, request: DeleteFileRequest):
     try:
-        delete_chunks = request.delete_chunks if request.delete_chunks is not None else request.hard_delete
+        logger.info(f"[delete_vector_file] Deletando arquivo {original_file_id}")
+        hard_delete = request.hard_delete if request.hard_delete is not None else True
         result = vector_admin_service.delete_file(
             original_file_id,
             request.confirmation_phrase,
             request.reason,
-            delete_chunks,
+            hard_delete,
         )
         normalized = _normalize_delete_response(original_file_id, result)
         return DeleteFileResponse(**normalized)
     except Exception as e:
-        logger.exception("Erro ao deletar arquivo vetorial")
+        logger.exception(f"[delete_vector_file] Erro")
         raise HTTPException(status_code=500, detail=f"Erro ao deletar arquivo: {str(e)}")
 
 @app.post("/admin/vector-base/cleanup", response_model=CleanupVectorBaseResponse)
 async def cleanup_vector_base(request: CleanupVectorBaseRequest):
     try:
+        logger.info(f"[cleanup_vector_base] Executando cleanup")
         if request.dry_run is True and request.confirmation_phrase == "SIMULACAO":
             result = vector_admin_service.cleanup(True)
         else:
@@ -186,19 +200,22 @@ async def cleanup_vector_base(request: CleanupVectorBaseRequest):
         normalized = _normalize_cleanup_response(result)
         return CleanupVectorBaseResponse(**normalized)
     except Exception as e:
-        logger.exception("Erro ao executar cleanup vetorial")
+        logger.exception(f"[cleanup_vector_base] Erro")
         raise HTTPException(status_code=500, detail=f"Erro ao executar cleanup: {str(e)}")
 
 @app.post("/admin/vector-base/reindex", response_model=ReindexFileResponse)
 async def reindex_vector_base(request: ReindexFileRequest):
     try:
+        logger.info(f"[reindex_vector_base] Iniciando reindexação")
         file_ids = request.original_file_ids or []
         result = await vector_admin_service.reindex_files(file_ids)
         normalized = _normalize_reindex_response(request, result)
         return ReindexFileResponse(**normalized)
     except Exception as e:
-        logger.exception("Erro ao reindexar base vetorial")
+        logger.exception(f"[reindex_vector_base] Erro")
         raise HTTPException(status_code=500, detail=f"Erro ao reindexar base: {str(e)}")
+
+# ========== FUNÇÕES AUXILIARES ==========
 
 def _normalize_role(value: Any) -> str:
     if isinstance(value, str):
