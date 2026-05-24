@@ -2,7 +2,7 @@ import logging
 import time
 import os
 import tempfile
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
@@ -10,6 +10,9 @@ from app.database import supabase_admin
 from app.services.vector_admin_service import vector_admin_service
 from app.services.rag_service import rag_service
 from app.auth.auth_service import auth_service
+from app.dependencies import get_current_user, get_current_admin_user
+from app.services.video_service import video_service
+from app.video_schemas import VideoUploadResponse, VideoListResponse, VideoDeleteResponse
 
 from app.vector_admin_schemas import (
     VectorFileSummary,
@@ -214,6 +217,100 @@ async def reindex_vector_base(request: ReindexFileRequest):
     except Exception as e:
         logger.exception(f"[reindex_vector_base] Erro")
         raise HTTPException(status_code=500, detail=f"Erro ao reindexar base: {str(e)}")
+
+# ========== ROTAS VÍDEOS ==========
+
+@app.post("/videos/upload", response_model=VideoUploadResponse)
+async def upload_video(
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    description: str = Form(""),
+    category: str = Form("geral"),
+    current_user: dict = Depends(get_current_admin_user),  # 🔒 somente admin
+):
+    """
+    Faz upload de um vídeo para a biblioteca.
+    Requer autenticação com role=admin.
+    Formatos aceitos: .mp4, .webm, .mov
+    """
+    temp_path = None
+    try:
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="Arquivo inválido")
+
+        ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+        if ext not in ("mp4", "webm", "mov"):
+            raise HTTPException(
+                status_code=400,
+                detail="Formato não suportado. Use: .mp4, .webm ou .mov",
+            )
+
+        logger.info(
+            "[upload_video] admin=%s filename=%s title='%s'",
+            current_user["email"], file.filename, title,
+        )
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
+            temp_path = tmp.name
+            content = await file.read()
+            tmp.write(content)
+
+        result = video_service.upload_video(
+            file_path=temp_path,
+            filename=file.filename,
+            title=title,
+            description=description,
+            category=category,
+            uploader_id=current_user["id"],
+        )
+        return result
+
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("[upload_video] erro inesperado")
+        raise HTTPException(status_code=500, detail=f"Erro no upload: {str(e)}")
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+@app.get("/videos", response_model=VideoListResponse)
+async def list_videos(
+    current_user: dict = Depends(get_current_user),  # 🔑 qualquer usuário autenticado
+):
+    """
+    Retorna a lista de vídeos com signed URLs válidas por 24 h.
+    Requer autenticação (qualquer role).
+    """
+    try:
+        logger.info("[list_videos] user=%s", current_user["email"])
+        return video_service.list_videos()
+    except Exception as e:
+        logger.exception("[list_videos] erro")
+        raise HTTPException(status_code=500, detail=f"Erro ao listar vídeos: {str(e)}")
+
+
+@app.delete("/videos/{video_id}", response_model=VideoDeleteResponse)
+async def delete_video(
+    video_id: str,
+    current_user: dict = Depends(get_current_admin_user),  # 🔒 somente admin
+):
+    """
+    Remove um vídeo da biblioteca (Storage + metadados).
+    Requer autenticação com role=admin.
+    """
+    try:
+        logger.info("[delete_video] admin=%s video_id=%s", current_user["email"], video_id)
+        return video_service.delete_video(video_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("[delete_video] erro")
+        raise HTTPException(status_code=500, detail=f"Erro ao deletar vídeo: {str(e)}")
+
 
 # ========== FUNÇÕES AUXILIARES ==========
 
