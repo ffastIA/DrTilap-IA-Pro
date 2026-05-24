@@ -4,6 +4,7 @@ import time
 import json
 import hashlib
 import logging
+import httpx
 from typing import TypedDict, Dict, Any, List, Literal, Optional
 
 logger = logging.getLogger(__name__)
@@ -13,6 +14,30 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import SupabaseVectorStore
 from langchain_community.document_loaders import PyPDFLoader
+try:
+    import pdfplumber
+    _PDFPLUMBER_AVAILABLE = True
+except ImportError:
+    _PDFPLUMBER_AVAILABLE = False
+
+try:
+    import fitz as _fitz  # PyMuPDF — renderização de páginas para Vision OCR / Tesseract
+    _PYMUPDF_AVAILABLE = True
+except ImportError:
+    _PYMUPDF_AVAILABLE = False
+
+try:
+    import pytesseract as _pytesseract
+    _PYTESSERACT_AVAILABLE = True
+except ImportError:
+    _PYTESSERACT_AVAILABLE = False
+
+# Locais comuns do Tesseract no Windows
+_TESSERACT_PATHS = [
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    r"C:\Users\usuario\AppData\Local\Tesseract-OCR\tesseract.exe",
+]
 from langgraph.graph import StateGraph, END
 from app.database import supabase_admin
 from app.utils.pdf_cleaning import clean_loaded_pages, is_editorial_or_low_value, contains_scientific_signal
@@ -36,11 +61,21 @@ class RAGService:
             supabase_url: str,
             supabase_key: str,
     ):
-        self.embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
+        # Bypass SSL corporativo — necessário no ambiente com proxy de inspeção TLS
+        _http_client = httpx.Client(verify=False)
+        _http_async_client = httpx.AsyncClient(verify=False)
+
+        self.embeddings = OpenAIEmbeddings(
+            openai_api_key=openai_api_key,
+            http_client=_http_client,
+            http_async_client=_http_async_client,
+        )
         self.llm = ChatOpenAI(
             model="gpt-4o-mini",
             temperature=0,
             openai_api_key=openai_api_key,
+            http_client=_http_client,
+            http_async_client=_http_async_client,
         )
         # REFATORAÇÃO: Usar supabase_admin centralizado em vez de criar novo cliente
         self.supabase_admin = supabase_admin
@@ -76,13 +111,8 @@ class RAGService:
                     "original_file_name": original_filename,
                 }
 
-            # Carregar PDF
-            loader = PyPDFLoader(file_path)
-            raw_docs = loader.load()
-
-            # Corrigir source: PyPDFLoader usa o caminho temp; substituir pelo nome real
-            for doc in raw_docs:
-                doc.metadata['source'] = original_filename
+            # Carregar PDF com fallback automático para pdfplumber se texto garbled
+            raw_docs = self._load_pdf_with_fallback(file_path, original_filename)
 
             # Validar qualidade do PDF antes de qualquer processamento
             if not self._validate_pdf_quality(raw_docs):
@@ -161,6 +191,183 @@ class RAGService:
             )
             return False
 
+    def _load_pdf_with_fallback(self, file_path: str, original_filename: str) -> List[Document]:
+        """Carrega PDF com cadeia de fallbacks progressivos:
+        1. PyPDFLoader  (rápido, sem custo)
+        2. pdfplumber   (melhor para alguns encodings)
+        3. Vision OCR   (GPT-4o-mini + PyMuPDF — garante qualidade em qualquer PDF)
+        """
+        # ── 1. PyPDFLoader ────────────────────────────────────────────────────
+        loader = PyPDFLoader(file_path)
+        raw_docs = loader.load()
+        for doc in raw_docs:
+            doc.metadata['source'] = original_filename
+
+        combined = " ".join(d.page_content for d in raw_docs)
+        if not self._is_text_garbled(combined):
+            return raw_docs
+
+        logger.warning(
+            "[ingest] PyPDFLoader garbled (%.1f%% '?') — tentando pdfplumber",
+            100 * combined.count('?') / max(len(combined), 1),
+        )
+
+        # ── 2. pdfplumber ─────────────────────────────────────────────────────
+        if _PDFPLUMBER_AVAILABLE:
+            try:
+                import pdfplumber
+                plumber_docs: List[Document] = []
+                with pdfplumber.open(file_path) as pdf:
+                    for page_num, page in enumerate(pdf.pages):
+                        text = page.extract_text() or ""
+                        plumber_docs.append(Document(
+                            page_content=text,
+                            metadata={"source": original_filename, "page": page_num},
+                        ))
+                combined_plumber = " ".join(d.page_content for d in plumber_docs)
+                if len(combined_plumber.strip()) > 100 and not self._is_text_garbled(combined_plumber):
+                    logger.info("[ingest] pdfplumber OK (%d chars)", len(combined_plumber))
+                    return plumber_docs
+                logger.warning("[ingest] pdfplumber também garbled — tentando Vision OCR")
+            except Exception as exc:
+                logger.warning("[ingest] pdfplumber falhou (%s) — tentando Vision OCR", exc)
+
+        # ── 3. Tesseract OCR via PyMuPDF + pytesseract ───────────────────────
+        if _PYMUPDF_AVAILABLE and _PYTESSERACT_AVAILABLE:
+            try:
+                tesseract_docs = self._extract_text_via_tesseract(file_path, original_filename)
+                combined_tesseract = " ".join(d.page_content for d in tesseract_docs)
+                if len(combined_tesseract.strip()) > 200 and not self._is_text_garbled(combined_tesseract):
+                    logger.info("[ingest] Tesseract OCR OK (%d chars, %d páginas)",
+                                len(combined_tesseract), len(tesseract_docs))
+                    return tesseract_docs
+                logger.warning("[ingest] Tesseract OCR retornou pouco conteúdo — tentando Vision OCR")
+            except Exception as exc:
+                logger.warning("[ingest] Tesseract OCR falhou (%s) — tentando Vision OCR", exc)
+
+        # ── 4. Vision OCR via GPT-4o-mini + PyMuPDF (último recurso) ─────────
+        if _PYMUPDF_AVAILABLE:
+            try:
+                vision_docs = self._extract_text_via_vision(file_path, original_filename)
+                combined_vision = " ".join(d.page_content for d in vision_docs)
+                if len(combined_vision.strip()) > 200:
+                    logger.info("[ingest] Vision OCR OK (%d chars, %d páginas)",
+                                len(combined_vision), len(vision_docs))
+                    return vision_docs
+                logger.warning("[ingest] Vision OCR retornou pouco conteúdo — usando PyPDFLoader original")
+            except Exception as exc:
+                logger.error("[ingest] Vision OCR falhou (%s) — usando PyPDFLoader original", exc)
+
+        return raw_docs
+
+    def _extract_text_via_tesseract(self, file_path: str, original_filename: str) -> List[Document]:
+        """Extrai texto via Tesseract OCR (PyMuPDF renderiza → PIL → pytesseract).
+
+        Requer Tesseract instalado no sistema.
+        Usa idiomas 'por+eng' (português + inglês) para cobrir artigos bilíngues.
+        """
+        import io
+        import fitz as pymupdf
+        import pytesseract
+        from PIL import Image
+
+        # Configurar path do Tesseract se não estiver no PATH
+        if not pytesseract.pytesseract.tesseract_cmd or pytesseract.pytesseract.tesseract_cmd == "tesseract":
+            for path in _TESSERACT_PATHS:
+                import os
+                if os.path.exists(path):
+                    pytesseract.pytesseract.tesseract_cmd = path
+                    logger.info("[tesseract] Encontrado em: %s", path)
+                    break
+
+        docs: List[Document] = []
+        pdf = pymupdf.open(file_path)
+        total = len(pdf)
+        logger.info("[tesseract] iniciando OCR de %d páginas: %s", total, original_filename)
+
+        for page_num, page in enumerate(pdf):
+            mat = pymupdf.Matrix(2.5, 2.5)  # ~180 DPI — bom para OCR
+            pix = page.get_pixmap(matrix=mat, colorspace=pymupdf.csRGB)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            try:
+                text = pytesseract.image_to_string(img, lang="por+eng")
+                if text.strip():
+                    docs.append(Document(
+                        page_content=text,
+                        metadata={
+                            "source": original_filename,
+                            "page": page_num,
+                            "extraction_method": "tesseract_ocr",
+                        },
+                    ))
+                    logger.info("[tesseract] página %d/%d: %d chars", page_num + 1, total, len(text))
+            except Exception as exc:
+                logger.warning("[tesseract] página %d falhou: %s", page_num, exc)
+
+        pdf.close()
+        return docs
+
+    def _extract_text_via_vision(self, file_path: str, original_filename: str) -> List[Document]:
+        """Extrai texto de PDF via GPT Vision (PyMuPDF renderiza páginas → base64 → OpenAI).
+
+        Funciona mesmo em PDFs com fontes customizadas onde todo extrator de texto falha.
+        Custo: ~$0.002–0.01 por página (gpt-4o-mini com detail=high).
+        """
+        import base64
+        import fitz as pymupdf
+
+        prompt_text = (
+            "You are a scientific document transcription tool. "
+            "Extract ALL text from this page EXACTLY as it appears. "
+            "Include: all numbers, table values, column headers, row labels, "
+            "statistical notation (±, p-values, %, n=, confidence intervals), "
+            "and all body paragraphs. "
+            "For tables: preserve structure using | to separate columns, one row per line. "
+            "Example table row: 'T1 (100%) | 45.2 ± 3.1 | 312.5 | 1.82 | 98.3'. "
+            "Do NOT summarize, skip values, or add commentary. "
+            "Transcribe every character you see."
+        )
+
+        docs: List[Document] = []
+        pdf = pymupdf.open(file_path)
+        total_pages = len(pdf)
+        logger.info("[vision_ocr] iniciando OCR de %d páginas: %s", total_pages, original_filename)
+
+        for page_num, page in enumerate(pdf):
+            # Renderizar em ~150 DPI (fator 2.08) — equilibra qualidade e tamanho
+            mat = pymupdf.Matrix(2.08, 2.08)
+            pix = page.get_pixmap(matrix=mat, colorspace=pymupdf.csRGB)
+            img_b64 = base64.b64encode(pix.tobytes("png")).decode()
+
+            try:
+                message = HumanMessage(content=[
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{img_b64}",
+                            "detail": "high",
+                        },
+                    },
+                    {"type": "text", "text": prompt_text},
+                ])
+                resp = self.llm.invoke([message])
+                extracted = resp.content.strip()
+                if extracted:
+                    docs.append(Document(
+                        page_content=extracted,
+                        metadata={
+                            "source": original_filename,
+                            "page": page_num,
+                            "extraction_method": "vision_ocr",
+                        },
+                    ))
+                logger.info("[vision_ocr] página %d/%d: %d chars", page_num + 1, total_pages, len(extracted))
+            except Exception as exc:
+                logger.warning("[vision_ocr] página %d falhou: %s", page_num, exc)
+
+        pdf.close()
+        return docs
+
     def _validate_pdf_quality(self, docs: List[Document]) -> bool:
         """Valida se PDF extraído tem conteúdo mínimo: > 50 caracteres, > 0 páginas."""
         if not docs:
@@ -216,8 +423,16 @@ class RAGService:
         workflow = StateGraph(State)
 
         def retrieve(state: State) -> Dict[str, Any]:
-            """Nó: recupera docs e monta context."""
+            """Nó: recupera docs e monta context.
+
+            Para perguntas conceptuais, adiciona data companions (chunks mais
+            ricos em dados do mesmo arquivo) para garantir que tabelas e métricas
+            específicas estejam presentes no contexto mesmo sem alta similaridade semântica.
+            """
             docs = self._retrieve_docs_via_rpc(state["question"], k=20)
+            question_type = state.get("question_type", "conceptual")
+            if question_type in ("conceptual", "quantitative"):
+                docs = self._add_data_companion_chunks(docs, max_companions=5)
             context = "\n\n".join(doc.page_content for doc in docs)
             return {"context": context}
 
@@ -225,14 +440,22 @@ class RAGService:
             """Nó: gera resposta com prompt adaptado ao tipo de pergunta."""
             lang = state["language"]
             history = state.get("history", [])
-            question_type = state.get("question_type", "quantitative")
+            question_type = state.get("question_type", "conceptual")
+
+            # Se o tipo é quantitativo mas o contexto é pobre/garbled,
+            # usa template conceptual para evitar resposta toda vazia
+            effective_type = question_type
+            if question_type == "quantitative" and self._is_context_poor(state.get("context", "")):
+                effective_type = "conceptual"
+                logger.info("[generate] contexto pobre — degradando quantitative→conceptual")
+
             lang_instruction = (
                 "Responda COMPLETAMENTE em português (pt-BR)."
                 if lang == "pt-BR"
                 else "Respond COMPLETELY in English."
             )
 
-            system_content = self._build_system_prompt(question_type, lang_instruction)
+            system_content = self._build_system_prompt(effective_type, lang_instruction)
 
             # Montar lista de mensagens: system + histórico + pergunta atual com contexto
             messages = [SystemMessage(content=system_content)]
@@ -256,7 +479,7 @@ class RAGService:
             """Nó: avalia qualidade da resposta por tipo de pergunta + verificações de conteúdo."""
             answer = state["answer"]
             question = state["question"]
-            question_type = state.get("question_type", "quantitative")
+            question_type = state.get("question_type", "conceptual")
 
             # ── Verificações universais ────────────────────────────────────────
             has_content = len(answer.strip()) > 150
@@ -415,17 +638,44 @@ class RAGService:
         """Detecta o tipo da pergunta para selecionar o prompt adequado.
 
         Retorna: 'quantitative' | 'conceptual' | 'comparative' | 'methodological'
+
+        Quantitativo exige indicadores numéricos EXPLÍCITOS — nunca é o default.
+        Default seguro = conceptual.
         """
         q_lower = question.lower()
+
+        # Indicadores positivos de pergunta quantitativa: pede valor/medida específica
+        quantitative = {
+            'quanto pesa', 'quanto pesam', 'quanto foi', 'quanto cresceu', 'quanto mede',
+            'qual o valor', 'qual foi o valor', 'qual a taxa', 'qual foi a taxa',
+            'qual o percentual', 'qual a porcentagem', 'qual o índice',
+            'qual o ganho de peso', 'qual foi o ganho', 'qual a média', 'qual o fcr',
+            'qual a conversão alimentar', 'qual a sobrevivência', 'qual foi a sobrevivência',
+            'qual a biomassa', 'qual o peso final', 'qual o comprimento',
+            'quantos gramas', 'quantos cm', 'quantos dias', 'quantas semanas',
+            'how much', 'how many', 'what is the rate', 'what is the value',
+            'what percentage', 'what was the growth', 'what were the values',
+            'survival rate', 'feed conversion ratio', 'specific growth rate',
+        }
 
         conceptual = {
             'o que é', 'o que são', 'como funciona', 'como funcionam', 'explique',
             'defina', 'definição', 'por que', 'porque', 'o que significa',
             'descreva', 'qual a importância', 'qual é a importância',
-            # "what is a/an" e "what are" são pedidos de definição (conceitual)
-            # "what is the" é pedido de valor específico (quantitativo) — excluído aqui
+            # consequências / efeitos / impactos → sempre conceptual
+            'consequencia', 'consequências', 'consequência', 'consequencias',
+            'efeito', 'efeitos', 'impacto', 'impactos',
+            'benefício', 'benefícios', 'vantagem', 'vantagens',
+            'desvantagem', 'desvantagens',
+            # verbos de causa-efeito (ex: "O que acarreta a restrição alimentar?")
+            'acarreta', 'acarretam', 'provoca', 'provocam', 'causa ', 'causam',
+            'implica', 'implicam', 'resulta', 'resultam', 'ocorre', 'acontece',
+            'leva a', 'levam a', 'afeta', 'afetam', 'influencia', 'influenciam',
+            'prejudica', 'prejudicam', 'interfere', 'interferecem',
+            # padrão inglês
             'what is a ', 'what is an ', 'what are', 'how does', 'how do', 'explain',
             'define', 'definition', 'why', 'what does', 'describe',
+            'consequences', 'effects', 'impacts', 'benefits', 'advantages',
         }
         comparative = {
             'compare', 'comparação', 'diferença', 'diferenças', 'melhor que',
@@ -441,22 +691,31 @@ class RAGService:
             'materials and methods',
         }
 
+        quantitative_score = sum(1 for t in quantitative if t in q_lower)
         conceptual_score = sum(1 for t in conceptual if t in q_lower)
         comparative_score = sum(1 for t in comparative if t in q_lower)
         methodological_score = sum(1 for t in methodological if t in q_lower)
 
-        # Em empate, tipos mais específicos de domínio ganham sobre o conceptual genérico
-        if conceptual_score > 0 and conceptual_score > max(comparative_score, methodological_score):
-            return 'conceptual'
-        if comparative_score > 0 and comparative_score > methodological_score:
+        # "o que" no início = pedido de explicação/definição → bônus conceptual
+        if q_lower.startswith('o que ') or q_lower.startswith('quais '):
+            conceptual_score += 1
+
+        # Tipos de domínio específicos primeiro
+        if comparative_score > 0 and comparative_score >= methodological_score:
             return 'comparative'
         if methodological_score > 0:
             return 'methodological'
-        if comparative_score > 0:
-            return 'comparative'
+
+        # Quantitativo só vence se tiver indicador EXPLÍCITO e nenhum conceptual
+        if quantitative_score > 0 and quantitative_score > conceptual_score:
+            return 'quantitative'
+
+        # Qualquer sinal conceptual → conceptual (inclui "o que acarreta", "o que provoca", etc.)
         if conceptual_score > 0:
             return 'conceptual'
-        return 'quantitative'
+
+        # Default seguro: conceptual — o template é flexível e não exige seções rígidas
+        return 'conceptual'
 
     def _build_system_prompt(self, question_type: str, lang_instruction: str) -> str:
         """Retorna o system prompt adequado ao tipo de pergunta."""
@@ -464,14 +723,30 @@ class RAGService:
         if question_type == 'conceptual':
             return (
                 f"You are an expert in tilapia aquaculture and fisheries science. {lang_instruction}\n\n"
-                f"Your task: Provide a clear, informative explanation based on the context provided.\n\n"
-                f"Write a well-structured response using natural paragraphs. Do NOT use rigid data sections.\n\n"
-                f"Focus on:\n"
-                f"- Clear definition or explanation of the concept\n"
-                f"- Underlying mechanisms or principles\n"
-                f"- Practical importance in aquaculture\n"
-                f"- Any relevant values mentioned in the context (cited naturally, not forced)\n\n"
-                f"If the context lacks enough information, say so clearly. Be concise and educational."
+                f"Your task: Answer the question using ONLY the scientific context provided, "
+                f"with maximum fidelity to the original data.\n\n"
+                f"MANDATORY RESPONSE STRUCTURE:\n\n"
+                f"**Dados do Estudo:**\n"
+                f"List ALL numeric values found in the context relevant to the question. "
+                f"Format as a bullet table: '• [Variable] ([Population/Treatment]): [Value] ([unit/stat])'. "
+                f"Examples:\n"
+                f"  • Coeficiente de endogamia FIS (SAW): 0.44 — mais alto do estudo\n"
+                f"  • Coeficiente de endogamia FIS (ILH): 0.05 — mais baixo do estudo\n"
+                f"  • Distância genética DEST: 0.00–0.818 (variação entre pares)\n"
+                f"  • Área de filé por ultrassom (ILH/GIFT): 7.05 vs SAL: 3.04\n"
+                f"If no numeric data is found in the context: write 'Dados numéricos não disponíveis no contexto.'\n\n"
+                f"**Interpretação:**\n"
+                f"Explain what the data means, using the populations/treatments by name. "
+                f"Connect each numeric finding to its biological or practical significance as stated "
+                f"in the study. Do not extrapolate beyond what the authors conclude.\n\n"
+                f"**Implicações / Recomendações:**\n"
+                f"List only conclusions and recommendations explicitly stated in the context.\n\n"
+                f"GROUNDING RULES (mandatory):\n"
+                f"  • Every claim in Interpretação must link to a value in Dados do Estudo\n"
+                f"  • Name populations/stocks individually — never write 'algumas populações'\n"
+                f"  • Do NOT add general aquaculture knowledge not in the context\n"
+                f"  • Prefer 'O estudo encontrou X=Y' over 'X é geralmente importante para Y'\n"
+                f"  • If context is insufficient for a section, say so explicitly"
             )
 
         if question_type == 'comparative':
@@ -528,7 +803,9 @@ class RAGService:
             f"- Study limitations mentioned in the text\n"
             f"- If not found: 'Empty section.'\n\n"
             f"RULES: Never write section headers without content. "
-            f"Pair all numbers with their labels. Scan every line for digits."
+            f"Pair all numbers with their labels. Scan every line for digits. "
+            f"CRITICAL: when a section has no data in the context, write EXACTLY 'Empty section.' "
+            f"(do not translate or rephrase — this exact string is required for quality control)."
         )
 
     def _rewrite_query(self, question: str, lang: str) -> str:
@@ -593,7 +870,17 @@ class RAGService:
     # ── Auxiliares de avaliação de qualidade ──────────────────────────────────
 
     def _is_answer_relevant(self, question: str, answer: str) -> bool:
-        """Verifica se ao menos um termo significativo da pergunta aparece na resposta."""
+        """Verifica se ao menos um termo significativo da pergunta aparece na resposta.
+
+        Normaliza acentos antes de comparar para evitar falsos negativos em pt-BR:
+        ex.: "indice" (pergunta sem acento) deve bater em "índice" (resposta com acento).
+        """
+        import unicodedata
+
+        def _norm(s: str) -> str:
+            """Remove diacríticos e converte para ASCII minúsculo."""
+            return unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('ascii').lower()
+
         stopwords = {
             'o', 'a', 'os', 'as', 'um', 'uma', 'de', 'da', 'do', 'em', 'para',
             'com', 'por', 'que', 'foi', 'the', 'an', 'of', 'in', 'for', 'is',
@@ -606,8 +893,8 @@ class RAGService:
         ]
         if not words:
             return True
-        answer_lower = answer.lower()
-        return any(w in answer_lower for w in words)
+        answer_normalized = _norm(answer)
+        return any(_norm(w) in answer_normalized for w in words)
 
     def _data_section_has_numbers(self, answer: str) -> bool:
         """Verifica se a seção DATA contém números reais (não só o cabeçalho)."""
@@ -676,6 +963,76 @@ class RAGService:
             return sim + bonus
 
         return sorted(docs, key=rerank_key, reverse=True)
+
+    def _is_text_garbled(self, text: str, threshold: float = 0.04) -> bool:
+        """Detecta texto com problema de encoding: muitos '?' indicam caracteres não decodificados."""
+        if not text or len(text) < 50:
+            return True
+        ratio = text.count('?') / len(text)
+        return ratio > threshold
+
+    def _is_context_poor(self, context: str) -> bool:
+        """Retorna True se o contexto recuperado é insuficiente para resposta quantitativa."""
+        if not context or len(context.strip()) < 200:
+            return True
+        return self._is_text_garbled(context)
+
+    def _add_data_companion_chunks(
+        self,
+        docs: List[Document],
+        max_companions: int = 5,
+    ) -> List[Document]:
+        """Injeta os chunks mais ricos em dados do mesmo arquivo que ficaram fora da busca semântica.
+
+        Para perguntas conceptuais/implicações, a busca semântica retorna os chunks de
+        discussão/conclusão com alta similaridade, mas esses chunks não contêm as tabelas
+        e métricas (FIS, DEST, p-values) que suportam as afirmações. Este método adiciona
+        os N chunks com maior densidade numérica de cada arquivo já presente no contexto.
+        """
+        present_ids = {d.metadata.get("db_id") for d in docs}
+        file_ids = {
+            d.metadata.get("original_file_id")
+            for d in docs
+            if d.metadata.get("original_file_id")
+        }
+        if not file_ids:
+            return docs
+
+        companions: List[Document] = []
+        for file_id in file_ids:
+            try:
+                resp = (
+                    self.supabase_admin.table("documents")
+                    .select("id, content, metadata")
+                    .filter("metadata->>original_file_id", "eq", file_id)
+                    .execute()
+                )
+                # Ordenar por densidade de dígitos — chunks de tabelas têm muitos números
+                def digit_density(row: Dict[str, Any]) -> float:
+                    c = row.get("content", "")
+                    return sum(1 for ch in c if ch.isdigit()) / max(len(c), 1)
+
+                sorted_rows = sorted(resp.data, key=digit_density, reverse=True)
+                added = 0
+                for row in sorted_rows:
+                    if added >= max_companions:
+                        break
+                    db_id = row["id"]
+                    if db_id in present_ids:
+                        continue
+                    meta = dict(row.get("metadata") or {})
+                    meta["db_id"] = db_id
+                    meta["similarity"] = 0.0   # não veio da busca semântica
+                    meta["companion"] = True
+                    companions.append(Document(page_content=row["content"], metadata=meta))
+                    present_ids.add(db_id)
+                    added += 1
+            except Exception as exc:
+                logger.warning("[data_companion] falha ao buscar chunks de %s: %s", file_id, exc)
+
+        if companions:
+            logger.info("[data_companion] adicionando %d chunks de dados ao contexto", len(companions))
+        return docs + companions
 
     def _retrieve_docs_via_rpc(
         self,

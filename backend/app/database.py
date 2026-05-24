@@ -2,9 +2,10 @@
 
 import logging
 import os
+import httpx
 from pathlib import Path
 from dotenv import load_dotenv
-from supabase import create_client, Client
+from supabase import create_client, Client, ClientOptions
 
 
 logger = logging.getLogger(__name__)
@@ -45,9 +46,12 @@ logger.info(f'Tipo de chave para supabase_auth: {supabase_auth_key_type}')
 logger.info(f'Tipo de chave para supabase_admin: {supabase_admin_key_type}')
 
 
+# Bypass SSL corporativo (proxy de inspeção TLS)
+_ssl_options = ClientOptions(httpx_client=httpx.Client(verify=False))
+
 # Cria os clientes Supabase
-supabase_auth: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-supabase_admin: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+supabase_auth: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=_ssl_options)
+supabase_admin: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, options=_ssl_options)
 
 # Alias legado para compatibilidade com código existente
 supabase: Client = supabase_admin
