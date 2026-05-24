@@ -2,8 +2,9 @@
 
 'use client';
 
-import { ChangeEvent, useRef } from 'react';
+import { ChangeEvent, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
+import { useAuthStore } from '@/store/authStore';
 import useRagAdmin from '@/hooks/useRagAdmin';
 
 function formatDate(value: Date | null | undefined, hasValid?: boolean): string {
@@ -29,7 +30,20 @@ function safeSource(item: any): string {
 }
 
 export default function AdminPage() {
-  const router = useRouter();
+  const router  = useRouter();
+  const user    = useAuthStore((state) => state.user);
+  const loading = useAuthStore((state) => state.isLoading);
+
+  // Defesa em profundidade: redireciona no cliente mesmo se o middleware falhar
+  useEffect(() => {
+    if (!loading && user && user.role !== 'admin') {
+      router.replace('/main/hub');
+    }
+  }, [user, loading, router]);
+
+  // Aguarda carregamento da sessão; middleware já bloqueou antes do JS rodar
+  if (loading || !user || user.role !== 'admin') return null;
+
   const {
     items,
     isLoadingList,

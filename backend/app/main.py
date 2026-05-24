@@ -52,9 +52,17 @@ class ChatRequest(BaseModel):
     history: List[List[str]] = []
 
 app = FastAPI()
+
+# Origens permitidas — definir ALLOWED_ORIGINS no .env em produção
+# Exemplo: ALLOWED_ORIGINS=https://app.drtilapia.com,https://www.drtilapia.com
+_ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -90,7 +98,7 @@ async def login(data: LoginRequest):
         raise HTTPException(status_code=500, detail="Erro interno do servidor")
 
 @app.post("/consultoria/chat")
-async def chat(data: ChatRequest):
+async def chat(data: ChatRequest, current_user: dict = Depends(get_current_user)):
     try:
         response = rag_service.get_answer(data.message, data.history)
         return {"answer": response, "sources": []}
@@ -100,10 +108,13 @@ async def chat(data: ChatRequest):
         logger.exception("Erro no chat")
         raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
 
-# ========== ROTAS ADMIN (SEM AUTENTICAÇÃO) ==========
+# ========== ROTAS ADMIN (requer role=admin) ==========
 
 @app.post("/admin/upload")
-async def upload_admin(file: UploadFile = File(...)):
+async def upload_admin(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_admin_user),
+):
     temp_path = None
     try:
         logger.info(f"[upload_admin] Iniciando upload para filename={file.filename}")
@@ -131,7 +142,7 @@ async def upload_admin(file: UploadFile = File(...)):
             os.unlink(temp_path)
 
 @app.get("/admin/vector-base/files", response_model=List[VectorFileSummary])
-async def get_vector_files():
+async def get_vector_files(current_user: dict = Depends(get_current_admin_user)):
     try:
         logger.info(f"[get_vector_files] Listando arquivos")
         return vector_admin_service.get_files()
@@ -140,7 +151,7 @@ async def get_vector_files():
         raise HTTPException(status_code=500, detail=f"Erro ao listar arquivos: {str(e)}")
 
 @app.get("/admin/vector-base/files/{original_file_id}", response_model=VectorFileDetail)
-async def get_vector_file(original_file_id: str):
+async def get_vector_file(original_file_id: str, current_user: dict = Depends(get_current_admin_user)):
     try:
         logger.info(f"[get_vector_file] Obtendo arquivo {original_file_id}")
         return vector_admin_service.get_file(original_file_id)
@@ -149,7 +160,7 @@ async def get_vector_file(original_file_id: str):
         raise HTTPException(status_code=500, detail=f"Erro ao obter arquivo: {str(e)}")
 
 @app.get("/admin/vector-base/files/{original_file_id}/chunks", response_model=VectorChunksResponse)
-async def get_vector_file_chunks(original_file_id: str):
+async def get_vector_file_chunks(original_file_id: str, current_user: dict = Depends(get_current_admin_user)):
     try:
         logger.info(f"[get_vector_file_chunks] Obtendo chunks de {original_file_id}")
         return vector_admin_service.get_file_chunks(original_file_id)
@@ -158,7 +169,7 @@ async def get_vector_file_chunks(original_file_id: str):
         raise HTTPException(status_code=500, detail=f"Erro ao obter chunks: {str(e)}")
 
 @app.get("/admin/vector-base/files/{original_file_id}/content", response_model=RecoverFileContentResponse)
-async def get_vector_file_content(original_file_id: str):
+async def get_vector_file_content(original_file_id: str, current_user: dict = Depends(get_current_admin_user)):
     try:
         logger.info(f"[get_vector_file_content] Recuperando conteúdo de {original_file_id}")
         return vector_admin_service.get_file_content(original_file_id)
@@ -167,7 +178,7 @@ async def get_vector_file_content(original_file_id: str):
         raise HTTPException(status_code=500, detail=f"Erro ao recuperar conteúdo: {str(e)}")
 
 @app.get("/admin/vector-base/files/{original_file_id}/diagnosis", response_model=RecoveryDiagnosisResponse)
-async def get_vector_file_diagnosis(original_file_id: str):
+async def get_vector_file_diagnosis(original_file_id: str, current_user: dict = Depends(get_current_admin_user)):
     try:
         logger.info(f"[get_vector_file_diagnosis] Diagnosticando {original_file_id}")
         return vector_admin_service.get_file_diagnosis(original_file_id)
@@ -176,7 +187,7 @@ async def get_vector_file_diagnosis(original_file_id: str):
         raise HTTPException(status_code=500, detail=f"Erro ao obter diagnóstico: {str(e)}")
 
 @app.post("/admin/vector-base/files/{original_file_id}/delete", response_model=DeleteFileResponse)
-async def delete_vector_file(original_file_id: str, request: DeleteFileRequest):
+async def delete_vector_file(original_file_id: str, request: DeleteFileRequest, current_user: dict = Depends(get_current_admin_user)):
     try:
         logger.info(f"[delete_vector_file] Deletando arquivo {original_file_id}")
         hard_delete = request.hard_delete if request.hard_delete is not None else True
@@ -193,7 +204,7 @@ async def delete_vector_file(original_file_id: str, request: DeleteFileRequest):
         raise HTTPException(status_code=500, detail=f"Erro ao deletar arquivo: {str(e)}")
 
 @app.post("/admin/vector-base/cleanup", response_model=CleanupVectorBaseResponse)
-async def cleanup_vector_base(request: CleanupVectorBaseRequest):
+async def cleanup_vector_base(request: CleanupVectorBaseRequest, current_user: dict = Depends(get_current_admin_user)):
     try:
         logger.info(f"[cleanup_vector_base] Executando cleanup")
         if request.dry_run is True and request.confirmation_phrase == "SIMULACAO":
@@ -207,7 +218,7 @@ async def cleanup_vector_base(request: CleanupVectorBaseRequest):
         raise HTTPException(status_code=500, detail=f"Erro ao executar cleanup: {str(e)}")
 
 @app.post("/admin/vector-base/reindex", response_model=ReindexFileResponse)
-async def reindex_vector_base(request: ReindexFileRequest):
+async def reindex_vector_base(request: ReindexFileRequest, current_user: dict = Depends(get_current_admin_user)):
     try:
         logger.info(f"[reindex_vector_base] Iniciando reindexação")
         file_ids = request.original_file_ids or []
