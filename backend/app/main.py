@@ -13,6 +13,13 @@ from app.auth.auth_service import auth_service
 from app.dependencies import get_current_user, get_current_admin_user
 from app.services.video_service import video_service
 from app.video_schemas import VideoUploadResponse, VideoListResponse, VideoDeleteResponse
+from app.services.fish_image_service import fish_image_service
+from app.services.image_processing_service import image_processing_service
+from app.fish_schemas import (
+    FishImageUploadResponse, FishImageListResponse, FishImageDeleteResponse,
+    FishAnalysisListResponse, FishAnalysisDeleteResponse,
+    ProcessRequest, ProcessResponse,
+)
 
 from app.vector_admin_schemas import (
     VectorFileSummary,
@@ -321,6 +328,258 @@ async def delete_video(
     except Exception as e:
         logger.exception("[delete_video] erro")
         raise HTTPException(status_code=500, detail=f"Erro ao deletar vídeo: {str(e)}")
+
+
+# ========== ROTAS ANÁLISE DE IMAGENS ==========
+
+@app.post("/fish/images/upload", response_model=FishImageUploadResponse)
+async def upload_fish_image(
+    file: UploadFile = File(...),
+    tag: str = Form(...),                              # 'lateral' | 'superior'
+    fator_conversao: Optional[float] = Form(None),    # px/cm manual (opcional)
+    current_user: dict = Depends(get_current_user),
+):
+    """Faz upload de uma imagem (lateral ou superior) para análise biométrica."""
+    temp_path = None
+    try:
+        suffix = "." + (file.filename or "img.jpg").rsplit(".", 1)[-1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(await file.read())
+            temp_path = tmp.name
+
+        return fish_image_service.upload_image(
+            file_path=temp_path,
+            filename=file.filename or "imagem.jpg",
+            tag=tag,
+            user_id=current_user["id"],
+            fator_conversao=fator_conversao,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("[upload_fish_image] erro")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+@app.get("/fish/images", response_model=FishImageListResponse)
+async def list_fish_images(
+    tag: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Lista imagens do usuário autenticado com filtros opcionais."""
+    try:
+        return fish_image_service.list_images(
+            user_id=current_user["id"],
+            tag=tag,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    except Exception as e:
+        logger.exception("[list_fish_images] erro")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/fish/images/{image_id}", response_model=FishImageDeleteResponse)
+async def delete_fish_image(
+    image_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Remove uma imagem individual (Storage + banco)."""
+    try:
+        return fish_image_service.delete_image(image_id, current_user["id"])
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        logger.exception("[delete_fish_image] erro")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/fish/analyses/process", response_model=ProcessResponse)
+async def process_fish_analysis(
+    data: ProcessRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Processa o par de imagens (lateral + superior) e cria a análise.
+
+    Etapas:
+      1. Baixa cada imagem do Supabase Storage
+      2. Detecta escala via ArUco (ou usa fator manual)
+      3. Remove fundo com rembg
+      4. Calcula bounding box e área da máscara
+      5. Cria registro em fish_analyses com as métricas consolidadas
+      6. Calcula Kvol se peso_g for informado
+    """
+    try:
+        user_id = current_user["id"]
+        warnings: list = []
+
+        # ── 1. Processar imagem lateral ───────────────────────────────────────
+        lat_result = fish_image_service.supabase.table("fish_images").select("*").eq("id", data.lateral_id).execute()
+        if not lat_result.data:
+            raise HTTPException(status_code=404, detail="Imagem lateral não encontrada")
+        lat_row = lat_result.data[0]
+        if lat_row["user_id"] != user_id:
+            raise HTTPException(status_code=403, detail="Sem permissão para esta imagem lateral")
+
+        sup_result = fish_image_service.supabase.table("fish_images").select("*").eq("id", data.superior_id).execute()
+        if not sup_result.data:
+            raise HTTPException(status_code=404, detail="Imagem superior não encontrada")
+        sup_row = sup_result.data[0]
+        if sup_row["user_id"] != user_id:
+            raise HTTPException(status_code=403, detail="Sem permissão para esta imagem superior")
+
+        # Atualiza status → processing
+        for img_id in [data.lateral_id, data.superior_id]:
+            fish_image_service.supabase.table("fish_images").update(
+                {"processing_status": "processing"}
+            ).eq("id", img_id).execute()
+
+        # ── 2. Download + processamento ───────────────────────────────────────
+        lat_bytes = fish_image_service.download_image_bytes(lat_row["storage_path"])
+        lat_metrics = image_processing_service.process_image(lat_bytes, data.fator_lateral)
+        warnings.extend(lat_metrics.pop("warnings", []))
+        lat_viz_b64 = lat_metrics.pop("viz_b64", None)
+
+        sup_bytes = fish_image_service.download_image_bytes(sup_row["storage_path"])
+        sup_metrics = image_processing_service.process_image(sup_bytes, data.fator_superior)
+        warnings.extend(sup_metrics.pop("warnings", []))
+        sup_viz_b64 = sup_metrics.pop("viz_b64", None)
+
+        # ── 3. Atualizar métricas em fish_images ──────────────────────────────
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+
+        fish_image_service.supabase.table("fish_images").update({
+            **{k: v for k, v in lat_metrics.items() if k != "fator_conversao"},
+            "fator_conversao": lat_metrics.get("fator_conversao") or data.fator_lateral,
+            "processing_status": "done",
+            "processed_at": now,
+        }).eq("id", data.lateral_id).execute()
+
+        fish_image_service.supabase.table("fish_images").update({
+            **{k: v for k, v in sup_metrics.items() if k != "fator_conversao"},
+            "fator_conversao": sup_metrics.get("fator_conversao") or data.fator_superior,
+            "processing_status": "done",
+            "processed_at": now,
+        }).eq("id", data.superior_id).execute()
+
+        # ── 4. Dimensões consolidadas ─────────────────────────────────────────
+        # Lateral: bbox_width=comprimento, bbox_height=altura
+        # Superior: bbox_height=largura (dimensão perpendicular ao comprimento)
+        comprimento_cm = lat_metrics.get("bbox_width_cm")
+        altura_cm = lat_metrics.get("bbox_height_cm")
+        largura_cm = sup_metrics.get("bbox_height_cm")
+
+        # ── 5. Calcular Kvol ──────────────────────────────────────────────────
+        kvol = None
+        if (data.peso_g and comprimento_cm and altura_cm and largura_cm
+                and comprimento_cm > 0 and altura_cm > 0 and largura_cm > 0):
+            kvol = round(data.peso_g / (comprimento_cm * altura_cm * largura_cm), 6)
+
+        # ── 6. Criar análise ──────────────────────────────────────────────────
+        analysis_row = {
+            "user_id": user_id,
+            "peso_g": data.peso_g,
+            "kvol": kvol,
+            "comprimento_cm": comprimento_cm,
+            "altura_cm": altura_cm,
+            "largura_cm": largura_cm,
+        }
+        analysis_result = fish_image_service.supabase.table("fish_analyses").insert(analysis_row).execute()
+        if not analysis_result.data:
+            raise RuntimeError("Falha ao criar análise no banco")
+
+        analysis_id = analysis_result.data[0]["id"]
+
+        # Vincular imagens à análise
+        for img_id in [data.lateral_id, data.superior_id]:
+            fish_image_service.supabase.table("fish_images").update(
+                {"analysis_id": analysis_id}
+            ).eq("id", img_id).execute()
+
+        if data.peso_g:
+            for img_id in [data.lateral_id, data.superior_id]:
+                fish_image_service.supabase.table("fish_images").update(
+                    {"peso_g": data.peso_g}
+                ).eq("id", img_id).execute()
+
+        logger.info("[process] análise criada id=%s kvol=%s", analysis_id, kvol)
+
+        return ProcessResponse(
+            analysis_id=analysis_id,
+            status="success",
+            message="Análise concluída com sucesso",
+            comprimento_cm=comprimento_cm,
+            altura_cm=altura_cm,
+            largura_cm=largura_cm,
+            kvol=kvol,
+            lateral_metrics=lat_metrics,
+            superior_metrics=sup_metrics,
+            lateral_viz_b64=lat_viz_b64,
+            superior_viz_b64=sup_viz_b64,
+            warnings=warnings,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("[process_fish_analysis] erro")
+        # Marcar imagens como erro
+        try:
+            for img_id in [data.lateral_id, data.superior_id]:
+                fish_image_service.supabase.table("fish_images").update(
+                    {"processing_status": "error", "processing_error": str(e)}
+                ).eq("id", img_id).execute()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/fish/analyses", response_model=FishAnalysisListResponse)
+async def list_fish_analyses(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    kvol_min: Optional[float] = None,
+    kvol_max: Optional[float] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Lista análises do usuário autenticado com filtros opcionais."""
+    try:
+        return fish_image_service.list_analyses(
+            user_id=current_user["id"],
+            date_from=date_from,
+            date_to=date_to,
+            kvol_min=kvol_min,
+            kvol_max=kvol_max,
+        )
+    except Exception as e:
+        logger.exception("[list_fish_analyses] erro")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/fish/analyses/{analysis_id}", response_model=FishAnalysisDeleteResponse)
+async def delete_fish_analysis(
+    analysis_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Remove análise + imagens associadas (Storage + banco)."""
+    try:
+        return fish_image_service.delete_analysis(analysis_id, current_user["id"])
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        logger.exception("[delete_fish_analysis] erro")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ========== FUNÇÕES AUXILIARES ==========

@@ -2,7 +2,7 @@
 
 import React from 'react';
 import Link from 'next/link';
-import { MessageSquareTextIcon, UploadCloudIcon, BarChart2Icon, UserIcon, VideoIcon } from 'lucide-react';
+import { MessageSquareTextIcon, UploadCloudIcon, BarChart2Icon, UserIcon, VideoIcon, ScanSearchIcon } from 'lucide-react';
 import { useAuthStore } from '@/store/authStore';
 import { useRouter } from 'next/navigation';
 
@@ -87,6 +87,13 @@ export default function HubPage() {
           title="Biblioteca de Vídeos"
           description="Acesse nossa galeria de vídeos instrutivos e tutoriais sobre piscicultura."
           href="/main/videos"
+        />
+
+        <FeatureCard
+          icon={ScanSearchIcon}
+          title="Análise de Imagens por IA"
+          description="Faça upload de imagens do peixe para calcular biometria, Kvol e acompanhar a evolução do plantel."
+          href="/main/images"
         />
 
         <FeatureCard

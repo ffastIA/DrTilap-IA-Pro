@@ -24,8 +24,30 @@ build/
 .pdf
 .docx
 
-# Claude Code — configurações locais com credenciais (nunca commitar)
+# Claude Code — apenas o settings.local.json tem credenciais (nunca commitar)
 .claude/settings.local.json
 
-# Segurança extra: ignorar qualquer settings.json dentro de .claude que contenha credenciais reais
-# O settings.json commitado só deve ter placeholders (sem senhas ou tokens)
+# Logs e arquivos temporários do backend
+backend/app/logs/
+backend/uvicorn.log
+backend/login_response.json
+backend/test_*.py
+backend/videos/
+
+# Scripts de diagnóstico pontuais
+backend/scripts/
+
+# Arquivos de análise/chat gerados localmente
+Chat*.pdf
+Chat*.docx
+Codigo*.pdf
+Diretorios*.pdf
+Supabase*.pdf
+htmlHub.txt
+Teste_url.py
+
+# Instaladores e binários
+Tesseract/
+
+# PDFs dos documentos da base RAG (arquivos grandes — manter fora do repositório)
+backend/docs/*.pdf
