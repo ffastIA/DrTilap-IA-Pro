@@ -3,10 +3,14 @@
 import axios from 'axios';
 import { useAuthStore } from '@/store/authStore';
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+// Usa o proxy reverso configurado em next.config.js (rewrites /api-proxy/* → backend).
+// Isso evita CORS completamente: o browser envia para localhost:3000/api-proxy/*
+// e o servidor Next.js repassa para localhost:8000/*.
+const API_BASE_URL = '/api-proxy';
 
 const api = axios.create({
   baseURL: API_BASE_URL,
+  timeout: 60000, // 60s — suficiente para upload de imagem + rembg
   headers: {
     'Content-Type': 'application/json',
   },

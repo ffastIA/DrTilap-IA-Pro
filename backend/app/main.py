@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 import os
@@ -343,11 +344,18 @@ async def upload_fish_image(
     temp_path = None
     try:
         suffix = "." + (file.filename or "img.jpg").rsplit(".", 1)[-1]
+        # await file.read() é assíncrono — OK no event loop
+        content = await file.read()
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(await file.read())
+            tmp.write(content)
             temp_path = tmp.name
 
-        return fish_image_service.upload_image(
+        # upload_image faz I/O de rede SÍNCRONO para o Supabase Storage.
+        # Chamá-lo diretamente num async def bloqueia o event loop inteiro,
+        # impedindo até respostas OPTIONS do CORS. Usar asyncio.to_thread
+        # executa a função em uma thread do pool sem bloquear o loop.
+        return await asyncio.to_thread(
+            fish_image_service.upload_image,
             file_path=temp_path,
             filename=file.filename or "imagem.jpg",
             tag=tag,
@@ -401,6 +409,122 @@ async def delete_fish_image(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _sync_process_fish_analysis(data: ProcessRequest, user_id: str) -> ProcessResponse:
+    """
+    Toda a lógica de processamento é síncrona (supabase-py + rembg + opencv).
+    Extraída aqui para ser chamada via asyncio.to_thread e não bloquear o event loop.
+    """
+    from datetime import datetime, timezone
+
+    warnings: list = []
+
+    # ── 1. Buscar e validar imagens ───────────────────────────────────────────
+    lat_result = fish_image_service.supabase.table("fish_images").select("*").eq("id", data.lateral_id).execute()
+    if not lat_result.data:
+        raise HTTPException(status_code=404, detail="Imagem lateral não encontrada")
+    lat_row = lat_result.data[0]
+    if lat_row["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Sem permissão para esta imagem lateral")
+
+    sup_result = fish_image_service.supabase.table("fish_images").select("*").eq("id", data.superior_id).execute()
+    if not sup_result.data:
+        raise HTTPException(status_code=404, detail="Imagem superior não encontrada")
+    sup_row = sup_result.data[0]
+    if sup_row["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Sem permissão para esta imagem superior")
+
+    # Atualiza status → processing
+    for img_id in [data.lateral_id, data.superior_id]:
+        fish_image_service.supabase.table("fish_images").update(
+            {"processing_status": "processing"}
+        ).eq("id", img_id).execute()
+
+    # ── 2. Download + processamento ───────────────────────────────────────────
+    lat_bytes = fish_image_service.download_image_bytes(lat_row["storage_path"])
+    lat_metrics = image_processing_service.process_image(lat_bytes, data.fator_lateral)
+    warnings.extend(lat_metrics.pop("warnings", []))
+    lat_viz_b64 = lat_metrics.pop("viz_b64", None)
+
+    sup_bytes = fish_image_service.download_image_bytes(sup_row["storage_path"])
+    sup_metrics = image_processing_service.process_image(sup_bytes, data.fator_superior)
+    warnings.extend(sup_metrics.pop("warnings", []))
+    sup_viz_b64 = sup_metrics.pop("viz_b64", None)
+
+    # ── 3. Atualizar métricas em fish_images ──────────────────────────────────
+    now = datetime.now(timezone.utc).isoformat()
+
+    fish_image_service.supabase.table("fish_images").update({
+        **{k: v for k, v in lat_metrics.items() if k != "fator_conversao"},
+        "fator_conversao": lat_metrics.get("fator_conversao") or data.fator_lateral,
+        "processing_status": "done",
+        "processed_at": now,
+    }).eq("id", data.lateral_id).execute()
+
+    fish_image_service.supabase.table("fish_images").update({
+        **{k: v for k, v in sup_metrics.items() if k != "fator_conversao"},
+        "fator_conversao": sup_metrics.get("fator_conversao") or data.fator_superior,
+        "processing_status": "done",
+        "processed_at": now,
+    }).eq("id", data.superior_id).execute()
+
+    # ── 4. Dimensões consolidadas ─────────────────────────────────────────────
+    # Lateral: bbox_width=comprimento, bbox_height=altura
+    # Superior: bbox_height=largura (dimensão perpendicular ao comprimento)
+    comprimento_cm = lat_metrics.get("bbox_width_cm")
+    altura_cm = lat_metrics.get("bbox_height_cm")
+    largura_cm = sup_metrics.get("bbox_height_cm")
+
+    # ── 5. Calcular Kvol ──────────────────────────────────────────────────────
+    kvol = None
+    if (data.peso_g and comprimento_cm and altura_cm and largura_cm
+            and comprimento_cm > 0 and altura_cm > 0 and largura_cm > 0):
+        kvol = round(data.peso_g / (comprimento_cm * altura_cm * largura_cm), 6)
+
+    # ── 6. Criar análise ──────────────────────────────────────────────────────
+    analysis_row = {
+        "user_id": user_id,
+        "peso_g": data.peso_g,
+        "kvol": kvol,
+        "comprimento_cm": comprimento_cm,
+        "altura_cm": altura_cm,
+        "largura_cm": largura_cm,
+    }
+    analysis_result = fish_image_service.supabase.table("fish_analyses").insert(analysis_row).execute()
+    if not analysis_result.data:
+        raise RuntimeError("Falha ao criar análise no banco")
+
+    analysis_id = analysis_result.data[0]["id"]
+
+    # Vincular imagens à análise
+    for img_id in [data.lateral_id, data.superior_id]:
+        fish_image_service.supabase.table("fish_images").update(
+            {"analysis_id": analysis_id}
+        ).eq("id", img_id).execute()
+
+    if data.peso_g:
+        for img_id in [data.lateral_id, data.superior_id]:
+            fish_image_service.supabase.table("fish_images").update(
+                {"peso_g": data.peso_g}
+            ).eq("id", img_id).execute()
+
+    logger.info("[process] análise criada id=%s kvol=%s", analysis_id, kvol)
+
+    return ProcessResponse(
+        analysis_id=analysis_id,
+        status="success",
+        message="Análise concluída com sucesso",
+        comprimento_cm=comprimento_cm,
+        altura_cm=altura_cm,
+        largura_cm=largura_cm,
+        kvol=kvol,
+        lateral_metrics=lat_metrics,
+        superior_metrics=sup_metrics,
+        lateral_viz_b64=lat_viz_b64,
+        superior_viz_b64=sup_viz_b64,
+        warnings=warnings,
+    )
+
+
 @app.post("/fish/analyses/process", response_model=ProcessResponse)
 async def process_fish_analysis(
     data: ProcessRequest,
@@ -416,123 +540,20 @@ async def process_fish_analysis(
       4. Calcula bounding box e área da máscara
       5. Cria registro em fish_analyses com as métricas consolidadas
       6. Calcula Kvol se peso_g for informado
+
+    Toda a lógica síncrona roda em asyncio.to_thread para não bloquear o event loop.
     """
     try:
-        user_id = current_user["id"]
-        warnings: list = []
-
-        # ── 1. Processar imagem lateral ───────────────────────────────────────
-        lat_result = fish_image_service.supabase.table("fish_images").select("*").eq("id", data.lateral_id).execute()
-        if not lat_result.data:
-            raise HTTPException(status_code=404, detail="Imagem lateral não encontrada")
-        lat_row = lat_result.data[0]
-        if lat_row["user_id"] != user_id:
-            raise HTTPException(status_code=403, detail="Sem permissão para esta imagem lateral")
-
-        sup_result = fish_image_service.supabase.table("fish_images").select("*").eq("id", data.superior_id).execute()
-        if not sup_result.data:
-            raise HTTPException(status_code=404, detail="Imagem superior não encontrada")
-        sup_row = sup_result.data[0]
-        if sup_row["user_id"] != user_id:
-            raise HTTPException(status_code=403, detail="Sem permissão para esta imagem superior")
-
-        # Atualiza status → processing
-        for img_id in [data.lateral_id, data.superior_id]:
-            fish_image_service.supabase.table("fish_images").update(
-                {"processing_status": "processing"}
-            ).eq("id", img_id).execute()
-
-        # ── 2. Download + processamento ───────────────────────────────────────
-        lat_bytes = fish_image_service.download_image_bytes(lat_row["storage_path"])
-        lat_metrics = image_processing_service.process_image(lat_bytes, data.fator_lateral)
-        warnings.extend(lat_metrics.pop("warnings", []))
-        lat_viz_b64 = lat_metrics.pop("viz_b64", None)
-
-        sup_bytes = fish_image_service.download_image_bytes(sup_row["storage_path"])
-        sup_metrics = image_processing_service.process_image(sup_bytes, data.fator_superior)
-        warnings.extend(sup_metrics.pop("warnings", []))
-        sup_viz_b64 = sup_metrics.pop("viz_b64", None)
-
-        # ── 3. Atualizar métricas em fish_images ──────────────────────────────
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc).isoformat()
-
-        fish_image_service.supabase.table("fish_images").update({
-            **{k: v for k, v in lat_metrics.items() if k != "fator_conversao"},
-            "fator_conversao": lat_metrics.get("fator_conversao") or data.fator_lateral,
-            "processing_status": "done",
-            "processed_at": now,
-        }).eq("id", data.lateral_id).execute()
-
-        fish_image_service.supabase.table("fish_images").update({
-            **{k: v for k, v in sup_metrics.items() if k != "fator_conversao"},
-            "fator_conversao": sup_metrics.get("fator_conversao") or data.fator_superior,
-            "processing_status": "done",
-            "processed_at": now,
-        }).eq("id", data.superior_id).execute()
-
-        # ── 4. Dimensões consolidadas ─────────────────────────────────────────
-        # Lateral: bbox_width=comprimento, bbox_height=altura
-        # Superior: bbox_height=largura (dimensão perpendicular ao comprimento)
-        comprimento_cm = lat_metrics.get("bbox_width_cm")
-        altura_cm = lat_metrics.get("bbox_height_cm")
-        largura_cm = sup_metrics.get("bbox_height_cm")
-
-        # ── 5. Calcular Kvol ──────────────────────────────────────────────────
-        kvol = None
-        if (data.peso_g and comprimento_cm and altura_cm and largura_cm
-                and comprimento_cm > 0 and altura_cm > 0 and largura_cm > 0):
-            kvol = round(data.peso_g / (comprimento_cm * altura_cm * largura_cm), 6)
-
-        # ── 6. Criar análise ──────────────────────────────────────────────────
-        analysis_row = {
-            "user_id": user_id,
-            "peso_g": data.peso_g,
-            "kvol": kvol,
-            "comprimento_cm": comprimento_cm,
-            "altura_cm": altura_cm,
-            "largura_cm": largura_cm,
-        }
-        analysis_result = fish_image_service.supabase.table("fish_analyses").insert(analysis_row).execute()
-        if not analysis_result.data:
-            raise RuntimeError("Falha ao criar análise no banco")
-
-        analysis_id = analysis_result.data[0]["id"]
-
-        # Vincular imagens à análise
-        for img_id in [data.lateral_id, data.superior_id]:
-            fish_image_service.supabase.table("fish_images").update(
-                {"analysis_id": analysis_id}
-            ).eq("id", img_id).execute()
-
-        if data.peso_g:
-            for img_id in [data.lateral_id, data.superior_id]:
-                fish_image_service.supabase.table("fish_images").update(
-                    {"peso_g": data.peso_g}
-                ).eq("id", img_id).execute()
-
-        logger.info("[process] análise criada id=%s kvol=%s", analysis_id, kvol)
-
-        return ProcessResponse(
-            analysis_id=analysis_id,
-            status="success",
-            message="Análise concluída com sucesso",
-            comprimento_cm=comprimento_cm,
-            altura_cm=altura_cm,
-            largura_cm=largura_cm,
-            kvol=kvol,
-            lateral_metrics=lat_metrics,
-            superior_metrics=sup_metrics,
-            lateral_viz_b64=lat_viz_b64,
-            superior_viz_b64=sup_viz_b64,
-            warnings=warnings,
+        # _sync_process_fish_analysis contém I/O de rede + CPU intensivo (rembg).
+        # asyncio.to_thread executa em thread pool — event loop permanece livre.
+        return await asyncio.to_thread(
+            _sync_process_fish_analysis, data, current_user["id"]
         )
-
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("[process_fish_analysis] erro")
-        # Marcar imagens como erro
+        # Marcar imagens como erro (best-effort)
         try:
             for img_id in [data.lateral_id, data.superior_id]:
                 fish_image_service.supabase.table("fish_images").update(
