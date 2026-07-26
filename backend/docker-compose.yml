@@ -8,9 +8,9 @@ services:
       - "8000:8000"
     volumes:
       - .:/app
-      - ../.env:/app/.env
+      - ./.env:/app/.env
     env_file:
-      - ../.env
+      - ./.env
     restart: always
 
 # Nota: Este compose é focado em desenvolvimento isolado do motor de IA.
