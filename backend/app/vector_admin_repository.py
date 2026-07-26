@@ -295,6 +295,22 @@ class VectorAdminRepository:
             'message': 'Diagnóstico recuperado com sucesso'
         }
 
+    def _count_ingestion_logs(self, original_file_id: str) -> int:
+        """Conta (sem deletar) logs de ingestão associados ao arquivo, para uso em prévias/simulações."""
+        total = 0
+        for table_name in ['ingestion_logs', 'rag_ingestion_logs']:
+            try:
+                response = (
+                    supabase_admin.table(table_name)
+                    .select('id', count='exact')
+                    .eq('original_file_id', original_file_id)
+                    .execute()
+                )
+                total += response.count or 0
+            except Exception as e:
+                self.logger.warning(f'Falha ao contar logs da tabela {table_name}: {e}')
+        return total
+
     def _best_effort_delete_ingestion_logs(self, original_file_id: str) -> int:
         total_deleted = 0
         for table_name in ['ingestion_logs', 'rag_ingestion_logs']:
@@ -354,6 +370,34 @@ class VectorAdminRepository:
             'message': message
         }
 
+    def preview_cleanup(self) -> Dict[str, Any]:
+        """Calcula, sem apagar nada, o que uma limpeza total removeria."""
+        files = self.list_files()
+        total_files_processed = len(files)
+        total_documents_deleted = sum(f['total_chunks'] for f in files)
+        total_storage_deleted = sum(
+            1 for f in files if f.get('storage_bucket') and f.get('storage_path')
+        )
+        total_ingestion_logs_deleted = sum(
+            self._count_ingestion_logs(f['original_file_id']) for f in files
+        )
+
+        message = (
+            f'Simulação concluída. Seriam processados: {total_files_processed} arquivos, '
+            f'removidos: {total_documents_deleted} docs, {total_ingestion_logs_deleted} logs, '
+            f'{total_storage_deleted} storages. Nenhum dado foi apagado.'
+        )
+
+        return {
+            'total_files_processed': total_files_processed,
+            'total_documents_deleted': total_documents_deleted,
+            'total_ingestion_logs_deleted': total_ingestion_logs_deleted,
+            'total_storage_deleted': total_storage_deleted,
+            'dry_run': True,
+            'status': 'success',
+            'message': message
+        }
+
     def cleanup_vector_base(self, confirmation_phrase: str) -> Dict[str, Any]:
         if confirmation_phrase != self.CONFIRMAR_LIMPEZA_TOTAL:
             raise ValueError('Frase de confirmação inválida para limpeza total')
@@ -391,6 +435,7 @@ class VectorAdminRepository:
             'total_documents_deleted': total_documents_deleted,
             'total_ingestion_logs_deleted': total_ingestion_logs_deleted,
             'total_storage_deleted': total_storage_deleted,
+            'dry_run': False,
             'status': 'success',
             'message': message
         }

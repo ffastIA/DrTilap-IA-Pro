@@ -665,6 +665,7 @@ def _normalize_cleanup_response(result: Any) -> Dict[str, Any]:
             'total_documents_deleted': result.get('total_documents_deleted', 0),
             'total_ingestion_logs_deleted': result.get('total_ingestion_logs_deleted', 0),
             'total_storage_deleted': result.get('total_storage_deleted', 0),
+            'dry_run': result.get('dry_run', False),
             'status': result.get('status', 'success'),
             'message': result.get('message', 'Limpeza executada'),
         }
@@ -674,6 +675,7 @@ def _normalize_cleanup_response(result: Any) -> Dict[str, Any]:
             'total_documents_deleted': 0,
             'total_ingestion_logs_deleted': 0,
             'total_storage_deleted': 0,
+            'dry_run': False,
             'status': 'success',
             'message': 'Limpeza executada',
         }

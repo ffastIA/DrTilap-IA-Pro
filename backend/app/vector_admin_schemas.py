@@ -68,6 +68,7 @@ class CleanupVectorBaseResponse(BaseModel):
     total_documents_deleted: int = 0
     total_ingestion_logs_deleted: int = 0
     total_storage_deleted: int = 0
+    dry_run: bool = False
     status: str
     message: str
 

@@ -89,14 +89,7 @@ class VectorAdminService:
     def cleanup(self, confirmation_phrase: Union[str, bool] = True) -> Any:
         if isinstance(confirmation_phrase, bool):
             if confirmation_phrase:
-                return {
-                    'total_files_processed': 0,
-                    'total_documents_deleted': 0,
-                    'total_ingestion_logs_deleted': 0,
-                    'total_storage_deleted': 0,
-                    'status': 'success',
-                    'message': 'Cleanup simulation executed.'
-                }
+                return self._call_repo_method(['preview_cleanup'])
             else:
                 confirmation_phrase = 'CONFIRMAR_LIMPEZA_TOTAL'
         return self._call_repo_method(['cleanup', 'cleanup_vector_base', 'clear_vector_base'], confirmation_phrase)
