@@ -30,7 +30,9 @@ class DeleteFileRequest(BaseModel):
     def validate_fields(self):
         if self.delete_chunks is not None and self.hard_delete is None:
             self.hard_delete = self.delete_chunks
-        if not self.confirmation_phrase or self.confirmation_phrase.strip() == "" or self.confirmation_phrase.strip() == "CONFIRMADO":
+        if not self.confirmation_phrase or self.confirmation_phrase.strip() == "":
+            raise ValueError("confirmation_phrase é obrigatório para excluir um arquivo")
+        if self.confirmation_phrase.strip() == "CONFIRMADO":
             self.confirmation_phrase = "CONFIRMAR_EXCLUSAO"
         return self
 
@@ -54,11 +56,10 @@ class CleanupVectorBaseRequest(BaseModel):
     @model_validator(mode="after")
     def validate_fields(self):
         if not self.confirmation_phrase or self.confirmation_phrase.strip() == "":
-            if self.dry_run is True:
-                self.confirmation_phrase = "SIMULACAO"
-            else:
-                self.confirmation_phrase = "CONFIRMAR_LIMPEZA_TOTAL"
-        if self.confirmation_phrase and self.confirmation_phrase.strip() == "CONFIRMADO":
+            # Ausência de confirmação nunca autoriza a limpeza real — trata como simulação.
+            self.dry_run = True
+            self.confirmation_phrase = "SIMULACAO"
+        elif self.confirmation_phrase.strip() == "CONFIRMADO":
             self.confirmation_phrase = "CONFIRMAR_LIMPEZA_TOTAL"
         return self
 

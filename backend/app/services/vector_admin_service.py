@@ -81,8 +81,10 @@ class VectorAdminService:
     def delete_file(self, original_file_id: str, confirmation_phrase: Union[str, bool] = True,
                     reason: Optional[str] = None, hard_delete: bool = True) -> Any:
         if isinstance(confirmation_phrase, bool):
-            hard_delete = confirmation_phrase
-            confirmation_phrase = 'CONFIRMAR_EXCLUSAO'
+            raise ValueError(
+                "delete_file exige uma frase de confirmação explícita (string); "
+                "um valor booleano não pode ser usado para autorizar a exclusão."
+            )
         return self._call_repo_method(['delete_file', 'remove_file'], original_file_id, confirmation_phrase, reason,
                                       hard_delete)
 
@@ -90,8 +92,10 @@ class VectorAdminService:
         if isinstance(confirmation_phrase, bool):
             if confirmation_phrase:
                 return self._call_repo_method(['preview_cleanup'])
-            else:
-                confirmation_phrase = 'CONFIRMAR_LIMPEZA_TOTAL'
+            raise ValueError(
+                "cleanup exige uma frase de confirmação explícita (string) para executar a limpeza real; "
+                "um valor booleano não pode autorizar a exclusão."
+            )
         return self._call_repo_method(['cleanup', 'cleanup_vector_base', 'clear_vector_base'], confirmation_phrase)
 
     def cleanup_vector_base(self, confirmation_phrase: str) -> Any:

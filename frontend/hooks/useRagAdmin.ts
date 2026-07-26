@@ -81,7 +81,11 @@ export default function useRagAdmin() {
     setOperationMessage('');
     setOperationError(null);
     try {
-      const response = await deleteRagDocument({ ids: [selectedItem.id], delete_chunks: true });
+      const response = await deleteRagDocument({
+        ids: [selectedItem.id],
+        delete_chunks: true,
+        confirmation_phrase: 'CONFIRMADO',
+      });
       setLastDeleteResponse(response);
       if (response.deleted.length > 0) {
         setOperationMessage('Arquivo excluído com sucesso.');
