@@ -7,15 +7,46 @@
 //  1. /main/*  sem cookie de token   → redireciona para /auth/login
 //  2. /auth/*  com cookie de token   → redireciona para /main/hub (já logado)
 //  3. /main/admin  sem role=admin    → redireciona para /main/hub
+//     (o papel é verificado contra a API REST do Supabase usando o próprio
+//     access token do usuário — nunca a partir do cookie `user`, que é
+//     gravável pelo próprio navegador e não prova nada por si só. A policy
+//     de RLS `users_select_own` garante que a consulta só retorna a linha
+//     do usuário autenticado pelo token.)
 
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 
-export function middleware(request: NextRequest) {
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+async function isAdminToken(token: string): Promise<boolean> {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    // Configuração ausente — nega por padrão em vez de abrir uma falha de segurança silenciosa.
+    return false;
+  }
+  try {
+    const response = await fetch(`${SUPABASE_URL}/rest/v1/users?select=role`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        apikey: SUPABASE_ANON_KEY,
+      },
+      cache: 'no-store',
+    });
+    if (!response.ok) {
+      return false;
+    }
+    const rows = (await response.json()) as { role?: string }[];
+    return Array.isArray(rows) && rows.length === 1 && rows[0]?.role === 'admin';
+  } catch {
+    // Rede indisponível/erro de parsing — falha fechada (nega acesso).
+    return false;
+  }
+}
+
+export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
-  const token      = request.cookies.get('accessToken')?.value;
-  const userCookie = request.cookies.get('user')?.value;
+  const token = request.cookies.get('accessToken')?.value;
 
   const isProtected = pathname.startsWith('/main');
   const isAuthPage  = pathname.startsWith('/auth');
@@ -32,15 +63,10 @@ export function middleware(request: NextRequest) {
     return NextResponse.redirect(new URL('/main/hub', request.url));
   }
 
-  // ── Regra 3: /main/admin sem role=admin → hub ─────────────────────────────
+  // ── Regra 3: /main/admin sem role=admin (verificado via API) → hub ────────
   if (pathname.startsWith('/main/admin') && token) {
-    try {
-      const user = JSON.parse(userCookie ?? '{}') as { role?: string };
-      if (user?.role !== 'admin') {
-        return NextResponse.redirect(new URL('/main/hub', request.url));
-      }
-    } catch {
-      // Cookie corrompido — redireciona para hub por segurança
+    const isAdmin = await isAdminToken(token);
+    if (!isAdmin) {
       return NextResponse.redirect(new URL('/main/hub', request.url));
     }
   }
