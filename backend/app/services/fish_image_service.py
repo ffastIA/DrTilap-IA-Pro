@@ -19,7 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
-from app.database import supabase_admin
+from app.database import supabase_admin, get_user_scoped_client
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,11 @@ ALLOWED_EXTENSIONS: Dict[str, str] = {
 
 class FishImageService:
     def __init__(self) -> None:
-        self.supabase = supabase_admin
+        # Usado só para Storage (não há RLS em storage.objects para este bucket
+        # hoje). Leituras/escritas nas tabelas fish_images/fish_analyses usam um
+        # cliente escopado ao usuário chamador (ver get_user_scoped_client),
+        # para que as policies de RLS de posse já existentes sejam aplicadas.
+        self.supabase_admin = supabase_admin
         self.bucket = BUCKET_NAME
 
     # ── helpers ───────────────────────────────────────────────────────────────
@@ -52,7 +56,7 @@ class FishImageService:
 
     def _signed_url(self, storage_path: str) -> str:
         try:
-            resp = self.supabase.storage.from_(self.bucket).create_signed_url(
+            resp = self.supabase_admin.storage.from_(self.bucket).create_signed_url(
                 storage_path, SIGNED_URL_EXPIRY
             )
             if isinstance(resp, dict):
@@ -98,6 +102,7 @@ class FishImageService:
         filename: str,
         tag: str,
         user_id: str,
+        access_token: str,
         fator_conversao: Optional[float] = None,
     ) -> Dict[str, Any]:
         ext = Path(filename).suffix.lower()
@@ -114,7 +119,7 @@ class FishImageService:
         logger.info("[fish_service] upload: '%s' tag=%s → %s", filename, tag, storage_path)
 
         with open(file_path, "rb") as f:
-            self.supabase.storage.from_(self.bucket).upload(
+            self.supabase_admin.storage.from_(self.bucket).upload(
                 path=storage_path,
                 file=f,
                 file_options={"content-type": content_type},
@@ -128,10 +133,11 @@ class FishImageService:
             "fator_conversao": fator_conversao,
             "processing_status": "pending",
         }
-        result = self.supabase.table("fish_images").insert(row).execute()
+        user_client = get_user_scoped_client(access_token)
+        result = user_client.table("fish_images").insert(row).execute()
 
         if not result.data:
-            self.supabase.storage.from_(self.bucket).remove([storage_path])
+            self.supabase_admin.storage.from_(self.bucket).remove([storage_path])
             raise RuntimeError("Falha ao salvar metadados da imagem no banco")
 
         image_id = result.data[0]["id"]
@@ -148,12 +154,14 @@ class FishImageService:
     def list_images(
         self,
         user_id: str,
+        access_token: str,
         tag: Optional[str] = None,
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
     ) -> Dict[str, Any]:
+        user_client = get_user_scoped_client(access_token)
         query = (
-            self.supabase.table("fish_images")
+            user_client.table("fish_images")
             .select("*")
             .eq("user_id", user_id)
             .order("uploaded_at", desc=True)
@@ -172,13 +180,15 @@ class FishImageService:
     def list_analyses(
         self,
         user_id: str,
+        access_token: str,
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
         kvol_min: Optional[float] = None,
         kvol_max: Optional[float] = None,
     ) -> Dict[str, Any]:
+        user_client = get_user_scoped_client(access_token)
         query = (
-            self.supabase.table("fish_analyses")
+            user_client.table("fish_analyses")
             .select("*")
             .eq("user_id", user_id)
             .order("created_at", desc=True)
@@ -199,7 +209,7 @@ class FishImageService:
         for a in analyses:
             # Buscar imagens associadas
             imgs_result = (
-                self.supabase.table("fish_images")
+                user_client.table("fish_images")
                 .select("*")
                 .eq("analysis_id", a["id"])
                 .execute()
@@ -227,9 +237,10 @@ class FishImageService:
 
         return {"items": items, "total": len(items)}
 
-    def delete_image(self, image_id: str, user_id: str) -> Dict[str, Any]:
+    def delete_image(self, image_id: str, user_id: str, access_token: str) -> Dict[str, Any]:
+        user_client = get_user_scoped_client(access_token)
         result = (
-            self.supabase.table("fish_images")
+            user_client.table("fish_images")
             .select("id, storage_path, user_id")
             .eq("id", image_id)
             .execute()
@@ -242,18 +253,19 @@ class FishImageService:
 
         storage_deleted = False
         try:
-            self.supabase.storage.from_(self.bucket).remove([row["storage_path"]])
+            self.supabase_admin.storage.from_(self.bucket).remove([row["storage_path"]])
             storage_deleted = True
         except Exception as exc:
             logger.warning("[fish_service] falha ao remover storage %s: %s", row["storage_path"], exc)
 
-        self.supabase.table("fish_images").delete().eq("id", image_id).execute()
+        user_client.table("fish_images").delete().eq("id", image_id).execute()
         logger.info("[fish_service] imagem removida id=%s", image_id)
         return {"id": image_id, "status": "success", "message": "Imagem removida", "storage_deleted": storage_deleted}
 
-    def delete_analysis(self, analysis_id: str, user_id: str) -> Dict[str, Any]:
+    def delete_analysis(self, analysis_id: str, user_id: str, access_token: str) -> Dict[str, Any]:
+        user_client = get_user_scoped_client(access_token)
         result = (
-            self.supabase.table("fish_analyses")
+            user_client.table("fish_analyses")
             .select("id, user_id")
             .eq("id", analysis_id)
             .execute()
@@ -265,7 +277,7 @@ class FishImageService:
 
         # Buscar e remover imagens associadas do Storage
         imgs = (
-            self.supabase.table("fish_images")
+            user_client.table("fish_images")
             .select("id, storage_path")
             .eq("analysis_id", analysis_id)
             .execute()
@@ -274,22 +286,22 @@ class FishImageService:
         paths = [img["storage_path"] for img in imgs]
         if paths:
             try:
-                self.supabase.storage.from_(self.bucket).remove(paths)
+                self.supabase_admin.storage.from_(self.bucket).remove(paths)
             except Exception as exc:
                 logger.warning("[fish_service] falha ao remover storage da análise: %s", exc)
 
         # Cascade via FK remove fish_images automaticamente (ON DELETE SET NULL)
         # Deletamos manualmente para remover do storage antes
         for img in imgs:
-            self.supabase.table("fish_images").delete().eq("id", img["id"]).execute()
+            user_client.table("fish_images").delete().eq("id", img["id"]).execute()
 
-        self.supabase.table("fish_analyses").delete().eq("id", analysis_id).execute()
+        user_client.table("fish_analyses").delete().eq("id", analysis_id).execute()
         logger.info("[fish_service] análise removida id=%s", analysis_id)
         return {"id": analysis_id, "status": "success", "message": "Análise removida com sucesso"}
 
     def download_image_bytes(self, storage_path: str) -> bytes:
         """Faz download dos bytes da imagem do Supabase Storage para processamento."""
-        resp = self.supabase.storage.from_(self.bucket).download(storage_path)
+        resp = self.supabase_admin.storage.from_(self.bucket).download(storage_path)
         if isinstance(resp, (bytes, bytearray)):
             return bytes(resp)
         raise RuntimeError(f"Falha ao baixar imagem: {storage_path}")

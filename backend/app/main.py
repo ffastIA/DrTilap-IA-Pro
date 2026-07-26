@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
-from app.database import supabase_admin
+from app.database import supabase_admin, get_user_scoped_client
 from app.services.vector_admin_service import vector_admin_service
 from app.services.rag_service import rag_service
 from app.auth.auth_service import auth_service
@@ -360,6 +360,7 @@ async def upload_fish_image(
             filename=file.filename or "imagem.jpg",
             tag=tag,
             user_id=current_user["id"],
+            access_token=current_user["access_token"],
             fator_conversao=fator_conversao,
         )
     except ValueError as e:
@@ -383,6 +384,7 @@ async def list_fish_images(
     try:
         return fish_image_service.list_images(
             user_id=current_user["id"],
+            access_token=current_user["access_token"],
             tag=tag,
             date_from=date_from,
             date_to=date_to,
@@ -399,7 +401,7 @@ async def delete_fish_image(
 ):
     """Remove uma imagem individual (Storage + banco)."""
     try:
-        return fish_image_service.delete_image(image_id, current_user["id"])
+        return fish_image_service.delete_image(image_id, current_user["id"], current_user["access_token"])
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except PermissionError as e:
@@ -409,7 +411,7 @@ async def delete_fish_image(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _sync_process_fish_analysis(data: ProcessRequest, user_id: str) -> ProcessResponse:
+def _sync_process_fish_analysis(data: ProcessRequest, user_id: str, access_token: str) -> ProcessResponse:
     """
     Toda a lógica de processamento é síncrona (supabase-py + rembg + opencv).
     Extraída aqui para ser chamada via asyncio.to_thread e não bloquear o event loop.
@@ -417,16 +419,17 @@ def _sync_process_fish_analysis(data: ProcessRequest, user_id: str) -> ProcessRe
     from datetime import datetime, timezone
 
     warnings: list = []
+    user_client = get_user_scoped_client(access_token)
 
     # ── 1. Buscar e validar imagens ───────────────────────────────────────────
-    lat_result = fish_image_service.supabase.table("fish_images").select("*").eq("id", data.lateral_id).execute()
+    lat_result = user_client.table("fish_images").select("*").eq("id", data.lateral_id).execute()
     if not lat_result.data:
         raise HTTPException(status_code=404, detail="Imagem lateral não encontrada")
     lat_row = lat_result.data[0]
     if lat_row["user_id"] != user_id:
         raise HTTPException(status_code=403, detail="Sem permissão para esta imagem lateral")
 
-    sup_result = fish_image_service.supabase.table("fish_images").select("*").eq("id", data.superior_id).execute()
+    sup_result = user_client.table("fish_images").select("*").eq("id", data.superior_id).execute()
     if not sup_result.data:
         raise HTTPException(status_code=404, detail="Imagem superior não encontrada")
     sup_row = sup_result.data[0]
@@ -435,7 +438,7 @@ def _sync_process_fish_analysis(data: ProcessRequest, user_id: str) -> ProcessRe
 
     # Atualiza status → processing
     for img_id in [data.lateral_id, data.superior_id]:
-        fish_image_service.supabase.table("fish_images").update(
+        user_client.table("fish_images").update(
             {"processing_status": "processing"}
         ).eq("id", img_id).execute()
 
@@ -453,14 +456,14 @@ def _sync_process_fish_analysis(data: ProcessRequest, user_id: str) -> ProcessRe
     # ── 3. Atualizar métricas em fish_images ──────────────────────────────────
     now = datetime.now(timezone.utc).isoformat()
 
-    fish_image_service.supabase.table("fish_images").update({
+    user_client.table("fish_images").update({
         **{k: v for k, v in lat_metrics.items() if k != "fator_conversao"},
         "fator_conversao": lat_metrics.get("fator_conversao") or data.fator_lateral,
         "processing_status": "done",
         "processed_at": now,
     }).eq("id", data.lateral_id).execute()
 
-    fish_image_service.supabase.table("fish_images").update({
+    user_client.table("fish_images").update({
         **{k: v for k, v in sup_metrics.items() if k != "fator_conversao"},
         "fator_conversao": sup_metrics.get("fator_conversao") or data.fator_superior,
         "processing_status": "done",
@@ -489,7 +492,7 @@ def _sync_process_fish_analysis(data: ProcessRequest, user_id: str) -> ProcessRe
         "altura_cm": altura_cm,
         "largura_cm": largura_cm,
     }
-    analysis_result = fish_image_service.supabase.table("fish_analyses").insert(analysis_row).execute()
+    analysis_result = user_client.table("fish_analyses").insert(analysis_row).execute()
     if not analysis_result.data:
         raise RuntimeError("Falha ao criar análise no banco")
 
@@ -497,13 +500,13 @@ def _sync_process_fish_analysis(data: ProcessRequest, user_id: str) -> ProcessRe
 
     # Vincular imagens à análise
     for img_id in [data.lateral_id, data.superior_id]:
-        fish_image_service.supabase.table("fish_images").update(
+        user_client.table("fish_images").update(
             {"analysis_id": analysis_id}
         ).eq("id", img_id).execute()
 
     if data.peso_g:
         for img_id in [data.lateral_id, data.superior_id]:
-            fish_image_service.supabase.table("fish_images").update(
+            user_client.table("fish_images").update(
                 {"peso_g": data.peso_g}
             ).eq("id", img_id).execute()
 
@@ -547,7 +550,7 @@ async def process_fish_analysis(
         # _sync_process_fish_analysis contém I/O de rede + CPU intensivo (rembg).
         # asyncio.to_thread executa em thread pool — event loop permanece livre.
         return await asyncio.to_thread(
-            _sync_process_fish_analysis, data, current_user["id"]
+            _sync_process_fish_analysis, data, current_user["id"], current_user["access_token"]
         )
     except HTTPException:
         raise
@@ -555,8 +558,9 @@ async def process_fish_analysis(
         logger.exception("[process_fish_analysis] erro")
         # Marcar imagens como erro (best-effort)
         try:
+            error_client = get_user_scoped_client(current_user["access_token"])
             for img_id in [data.lateral_id, data.superior_id]:
-                fish_image_service.supabase.table("fish_images").update(
+                error_client.table("fish_images").update(
                     {"processing_status": "error", "processing_error": str(e)}
                 ).eq("id", img_id).execute()
         except Exception:
@@ -576,6 +580,7 @@ async def list_fish_analyses(
     try:
         return fish_image_service.list_analyses(
             user_id=current_user["id"],
+            access_token=current_user["access_token"],
             date_from=date_from,
             date_to=date_to,
             kvol_min=kvol_min,
@@ -593,7 +598,7 @@ async def delete_fish_analysis(
 ):
     """Remove análise + imagens associadas (Storage + banco)."""
     try:
-        return fish_image_service.delete_analysis(analysis_id, current_user["id"])
+        return fish_image_service.delete_analysis(analysis_id, current_user["id"], current_user["access_token"])
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except PermissionError as e:
