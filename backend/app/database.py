@@ -46,8 +46,18 @@ logger.info(f'Tipo de chave para supabase_auth: {supabase_auth_key_type}')
 logger.info(f'Tipo de chave para supabase_admin: {supabase_admin_key_type}')
 
 
-# Bypass SSL corporativo (proxy de inspeção TLS)
-_ssl_options = ClientOptions(httpx_client=httpx.Client(verify=False))
+def _resolve_ssl_verify():
+    """Resolve o valor de verificação TLS para os clientes httpx.
+
+    Por padrão, verifica o certificado do servidor normalmente (`True`).
+    Se o ambiente estiver atrás de um proxy corporativo de inspeção TLS,
+    define `SSL_CERT_FILE` ou `REQUESTS_CA_BUNDLE` apontando para o CA
+    bundle do proxy — nunca desabilite a verificação por completo.
+    """
+    return os.getenv('SSL_CERT_FILE') or os.getenv('REQUESTS_CA_BUNDLE') or True
+
+
+_ssl_options = ClientOptions(httpx_client=httpx.Client(verify=_resolve_ssl_verify()))
 
 # Cria os clientes Supabase
 supabase_auth: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=_ssl_options)
@@ -55,3 +65,21 @@ supabase_admin: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, 
 
 # Alias legado para compatibilidade com código existente
 supabase: Client = supabase_admin
+
+
+def get_user_scoped_client(access_token: str) -> Client:
+    """Cria um cliente Supabase novo, autenticado como o usuário chamador.
+
+    Usa a chave `anon` (baixo privilégio) e autentica as requisições
+    PostgREST subsequentes com o access_token do próprio usuário, ativando
+    Row Level Security. Cada chamada cria um cliente descartável — nunca
+    reaproveita um cliente compartilhado entre requisições/usuários
+    diferentes (mesmo padrão usado para isolar o login nesta sessão).
+    """
+    client = create_client(
+        SUPABASE_URL,
+        SUPABASE_KEY,
+        options=ClientOptions(httpx_client=httpx.Client(verify=_resolve_ssl_verify())),
+    )
+    client.postgrest.auth(access_token)
+    return client

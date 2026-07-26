@@ -39,7 +39,7 @@ _TESSERACT_PATHS = [
     r"C:\Users\usuario\AppData\Local\Tesseract-OCR\tesseract.exe",
 ]
 from langgraph.graph import StateGraph, END
-from app.database import supabase_admin
+from app.database import supabase_admin, _resolve_ssl_verify
 from app.utils.pdf_cleaning import clean_loaded_pages, is_editorial_or_low_value, contains_scientific_signal
 
 
@@ -61,9 +61,11 @@ class RAGService:
             supabase_url: str,
             supabase_key: str,
     ):
-        # Bypass SSL corporativo — necessário no ambiente com proxy de inspeção TLS
-        _http_client = httpx.Client(verify=False)
-        _http_async_client = httpx.AsyncClient(verify=False)
+        # Verificação TLS por padrão; use SSL_CERT_FILE/REQUESTS_CA_BUNDLE para
+        # apontar o CA bundle de um proxy corporativo de inspeção TLS, se necessário.
+        _ssl_verify = _resolve_ssl_verify()
+        _http_client = httpx.Client(verify=_ssl_verify)
+        _http_async_client = httpx.AsyncClient(verify=_ssl_verify)
 
         self.embeddings = OpenAIEmbeddings(
             openai_api_key=openai_api_key,
