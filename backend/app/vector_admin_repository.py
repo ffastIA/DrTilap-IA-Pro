@@ -295,34 +295,6 @@ class VectorAdminRepository:
             'message': 'Diagnóstico recuperado com sucesso'
         }
 
-    def _count_ingestion_logs(self, original_file_id: str) -> int:
-        """Conta (sem deletar) logs de ingestão associados ao arquivo, para uso em prévias/simulações."""
-        total = 0
-        for table_name in ['ingestion_logs', 'rag_ingestion_logs']:
-            try:
-                response = (
-                    supabase_admin.table(table_name)
-                    .select('id', count='exact')
-                    .eq('original_file_id', original_file_id)
-                    .execute()
-                )
-                total += response.count or 0
-            except Exception as e:
-                self.logger.warning(f'Falha ao contar logs da tabela {table_name}: {e}')
-        return total
-
-    def _best_effort_delete_ingestion_logs(self, original_file_id: str) -> int:
-        total_deleted = 0
-        for table_name in ['ingestion_logs', 'rag_ingestion_logs']:
-            try:
-                response = supabase_admin.table(table_name).delete().eq('original_file_id', original_file_id).execute()
-                deleted_count = len(response.data or [])
-                total_deleted += deleted_count
-                self.logger.info(f'Deletados {deleted_count} logs da tabela {table_name}')
-            except Exception as e:
-                self.logger.warning(f'Falha ao deletar logs da tabela {table_name}: {e}')
-        return total_deleted
-
     def delete_file(self, original_file_id: str, confirmation_phrase: str, reason: Optional[str] = None,
                     hard_delete: bool = True) -> Dict[str, Any]:
         if confirmation_phrase != self.CONFIRMAR_EXCLUSAO:
@@ -340,8 +312,6 @@ class VectorAdminRepository:
         else:
             documents_deleted = 0
 
-        ingestion_logs_deleted = self._best_effort_delete_ingestion_logs(original_file_id)
-
         storage_deleted = False
         storage_bucket = file_summary.get('storage_bucket')
         storage_path = file_summary.get('storage_path')
@@ -354,7 +324,7 @@ class VectorAdminRepository:
                 self.logger.error(f'Falha ao deletar storage {storage_path}: {e}')
                 storage_deleted = False
 
-        message = f'Arquivo deletado. {documents_deleted} documentos, {ingestion_logs_deleted} logs de ingestão.'
+        message = f'Arquivo deletado. {documents_deleted} documentos.'
         if storage_deleted:
             message += ' Storage removido.'
 
@@ -362,7 +332,6 @@ class VectorAdminRepository:
             'original_file_id': original_file_id,
             'original_file_name': file_summary.get('original_file_name'),
             'documents_deleted': documents_deleted,
-            'ingestion_logs_deleted': ingestion_logs_deleted,
             'storage_deleted': storage_deleted,
             'storage_bucket': storage_bucket,
             'storage_path': storage_path,
@@ -378,20 +347,15 @@ class VectorAdminRepository:
         total_storage_deleted = sum(
             1 for f in files if f.get('storage_bucket') and f.get('storage_path')
         )
-        total_ingestion_logs_deleted = sum(
-            self._count_ingestion_logs(f['original_file_id']) for f in files
-        )
-
         message = (
             f'Simulação concluída. Seriam processados: {total_files_processed} arquivos, '
-            f'removidos: {total_documents_deleted} docs, {total_ingestion_logs_deleted} logs, '
+            f'removidos: {total_documents_deleted} docs, '
             f'{total_storage_deleted} storages. Nenhum dado foi apagado.'
         )
 
         return {
             'total_files_processed': total_files_processed,
             'total_documents_deleted': total_documents_deleted,
-            'total_ingestion_logs_deleted': total_ingestion_logs_deleted,
             'total_storage_deleted': total_storage_deleted,
             'dry_run': True,
             'status': 'success',
@@ -405,7 +369,6 @@ class VectorAdminRepository:
         files = self.list_files()
         total_files_processed = len(files)
         total_documents_deleted = 0
-        total_ingestion_logs_deleted = 0
         total_storage_deleted = 0
 
         for file_info in files:
@@ -416,7 +379,6 @@ class VectorAdminRepository:
                     hard_delete=True
                 )
                 total_documents_deleted += del_resp['documents_deleted']
-                total_ingestion_logs_deleted += del_resp['ingestion_logs_deleted']
                 if del_resp['storage_deleted']:
                     total_storage_deleted += 1
             except Exception as e:
@@ -426,14 +388,12 @@ class VectorAdminRepository:
             f'Limpeza total concluída. '
             f'Processados: {total_files_processed} arquivos, '
             f'deletados: {total_documents_deleted} docs, '
-            f'{total_ingestion_logs_deleted} logs, '
             f'{total_storage_deleted} storages.'
         )
 
         return {
             'total_files_processed': total_files_processed,
             'total_documents_deleted': total_documents_deleted,
-            'total_ingestion_logs_deleted': total_ingestion_logs_deleted,
             'total_storage_deleted': total_storage_deleted,
             'dry_run': False,
             'status': 'success',

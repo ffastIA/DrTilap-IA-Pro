@@ -41,7 +41,6 @@ class DeleteFileResponse(BaseModel):
     original_file_id: str
     original_file_name: str
     documents_deleted: int = 0
-    ingestion_logs_deleted: int = 0
     storage_deleted: bool = False
     storage_bucket: Optional[str] = None
     storage_path: Optional[str] = None
@@ -67,7 +66,6 @@ class CleanupVectorBaseResponse(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
     total_files_processed: int = 0
     total_documents_deleted: int = 0
-    total_ingestion_logs_deleted: int = 0
     total_storage_deleted: int = 0
     dry_run: bool = False
     status: str

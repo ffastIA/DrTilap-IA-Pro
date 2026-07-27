@@ -5,7 +5,7 @@ import json
 import hashlib
 import logging
 import httpx
-from typing import TypedDict, Dict, Any, List, Literal, Optional
+from typing import TypedDict, Dict, Any, List, Literal, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 from langchain_core.documents import Document
@@ -41,6 +41,21 @@ _TESSERACT_PATHS = [
 from langgraph.graph import StateGraph, END
 from app.database import supabase_admin, _resolve_ssl_verify
 from app.utils.pdf_cleaning import clean_loaded_pages, is_editorial_or_low_value, contains_scientific_signal
+from app.utils.extraction_quality import assess_extraction, ExtractionQuality
+
+
+# Limites do OCR por página (custo ~US$ 0,002-0,01/página no Vision).
+# Sem teto, um PDF de centenas de páginas gera centenas de chamadas pagas.
+OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "40"))
+OCR_PAGE_TIMEOUT_SECONDS = float(os.getenv("OCR_PAGE_TIMEOUT_SECONDS", "60"))
+
+
+class ExtractionCostLimitExceeded(Exception):
+    """OCR por página excederia o teto configurado.
+
+    Levantada em vez de truncar: entregar um documento parcial rotulado como
+    completo é o problema que a detecção de extração se propõe a evitar.
+    """
 
 
 class State(TypedDict):
@@ -113,8 +128,36 @@ class RAGService:
                     "original_file_name": original_filename,
                 }
 
-            # Carregar PDF com fallback automático para pdfplumber se texto garbled
-            raw_docs = self._load_pdf_with_fallback(file_path, original_filename)
+            # Carregar PDF percorrendo a cascata de extração até obter qualidade adequada
+            try:
+                raw_docs, extraction_method, quality = self._load_pdf_with_fallback(
+                    file_path, original_filename
+                )
+            except ExtractionCostLimitExceeded as exc:
+                return {
+                    "status": "extraction_cost_limit",
+                    "message": str(exc),
+                    "original_file_id": original_file_id,
+                    "original_file_name": original_filename,
+                }
+
+            # Extração inadequada é erro, não sucesso silencioso: nada é gravado.
+            if not quality.adequate:
+                logger.error(
+                    "[ingest] '%s' rejeitado por qualidade de extração — %s",
+                    original_filename, quality.reason,
+                )
+                return {
+                    "status": "extraction_failed",
+                    "message": (
+                        f"A extração de texto deste PDF ficou incompleta e o documento "
+                        f"não foi ingerido. Detalhe: {quality.reason}."
+                    ),
+                    "extraction_method": extraction_method,
+                    "extraction_quality": quality.as_metadata(),
+                    "original_file_id": original_file_id,
+                    "original_file_name": original_filename,
+                }
 
             # Validar qualidade do PDF antes de qualquer processamento
             if not self._validate_pdf_quality(raw_docs):
@@ -137,10 +180,17 @@ class RAGService:
             # Filtrar chunks de baixo valor
             splits = self._filter_chunks(splits)
 
-            # Adicionar metadados normalizados ANTES de salvar
+            # Adicionar metadados normalizados ANTES de salvar.
+            # `extraction_method` é gravado para TODOS os caminhos (inclusive o
+            # pypdf primário), junto das métricas que justificaram o aceite —
+            # sem isso é impossível distinguir depois, olhando só a base, um
+            # documento bem extraído de um mal extraído.
+            quality_metadata = quality.as_metadata()
             for split in splits:
                 split.metadata['original_file_id'] = original_file_id
                 split.metadata['original_file_name'] = original_file_name
+                split.metadata['extraction_method'] = extraction_method
+                split.metadata['extraction_quality'] = quality_metadata
 
             # Adicionar ao vectorstore
             self.vectorstore.add_documents(splits)
@@ -152,6 +202,8 @@ class RAGService:
                 "chunks_before_filter": chunks_before_filter,
                 "chunks_filtered_out": chunks_before_filter - len(splits),
                 "pages_loaded": len(raw_docs),
+                "extraction_method": extraction_method,
+                "extraction_quality": quality_metadata,
                 "file_path": file_path,
                 "original_file_id": original_file_id,
                 "original_file_name": original_file_name,
@@ -193,11 +245,39 @@ class RAGService:
             )
             return False
 
-    def _load_pdf_with_fallback(self, file_path: str, original_filename: str) -> List[Document]:
+    def _accept_extraction(self, docs: List[Document], method: str) -> Optional[ExtractionQuality]:
+        """Decide se a extração de um estágio é aceitável.
+
+        Combina os dois critérios: encoding quebrado (`_is_text_garbled`, que
+        cobre mojibake) e extração incompleta (`assess_extraction`, que cobre
+        estrutura sem conteúdo). Retorna a qualidade se aceitável, senão None.
+        """
+        if not docs:
+            return None
+        combined = " ".join(d.page_content for d in docs)
+        if self._is_text_garbled(combined):
+            logger.warning("[ingest] %s: texto com encoding quebrado", method)
+            return None
+        quality = assess_extraction([d.page_content for d in docs])
+        if not quality.adequate:
+            logger.warning("[ingest] %s: extração incompleta — %s", method, quality.reason)
+            return None
+        return quality
+
+    def _load_pdf_with_fallback(
+        self, file_path: str, original_filename: str
+    ) -> Tuple[List[Document], str, ExtractionQuality]:
         """Carrega PDF com cadeia de fallbacks progressivos:
         1. PyPDFLoader  (rápido, sem custo)
-        2. pdfplumber   (melhor para alguns encodings)
-        3. Vision OCR   (GPT-4o-mini + PyMuPDF — garante qualidade em qualquer PDF)
+        2. pdfplumber   (melhor para alguns encodings e layouts)
+        3. Tesseract OCR
+        4. Vision OCR   (GPT-4o-mini + PyMuPDF — último recurso, com custo por página)
+
+        Cada estágio é aceito apenas se a extração for adequada — não basta ter
+        texto, é preciso ter conteúdo. Retorna (documentos, método, qualidade).
+        Quando nenhum estágio produz qualidade adequada, devolve a melhor
+        tentativa com `quality.adequate == False`, para o chamador falhar
+        explicitamente em vez de gravar conteúdo inútil.
         """
         # ── 1. PyPDFLoader ────────────────────────────────────────────────────
         loader = PyPDFLoader(file_path)
@@ -205,14 +285,10 @@ class RAGService:
         for doc in raw_docs:
             doc.metadata['source'] = original_filename
 
-        combined = " ".join(d.page_content for d in raw_docs)
-        if not self._is_text_garbled(combined):
-            return raw_docs
-
-        logger.warning(
-            "[ingest] PyPDFLoader garbled (%.1f%% '?') — tentando pdfplumber",
-            100 * combined.count('?') / max(len(combined), 1),
-        )
+        quality = self._accept_extraction(raw_docs, "pypdf")
+        if quality:
+            logger.info("[ingest] pypdf OK — %.0f palavras/página", quality.mean_words_per_page)
+            return raw_docs, "pypdf", quality
 
         # ── 2. pdfplumber ─────────────────────────────────────────────────────
         if _PDFPLUMBER_AVAILABLE:
@@ -226,41 +302,53 @@ class RAGService:
                             page_content=text,
                             metadata={"source": original_filename, "page": page_num},
                         ))
-                combined_plumber = " ".join(d.page_content for d in plumber_docs)
-                if len(combined_plumber.strip()) > 100 and not self._is_text_garbled(combined_plumber):
-                    logger.info("[ingest] pdfplumber OK (%d chars)", len(combined_plumber))
-                    return plumber_docs
-                logger.warning("[ingest] pdfplumber também garbled — tentando Vision OCR")
+                quality = self._accept_extraction(plumber_docs, "pdfplumber")
+                if quality:
+                    logger.info("[ingest] pdfplumber OK — %.0f palavras/página",
+                                quality.mean_words_per_page)
+                    return plumber_docs, "pdfplumber", quality
             except Exception as exc:
-                logger.warning("[ingest] pdfplumber falhou (%s) — tentando Vision OCR", exc)
+                logger.warning("[ingest] pdfplumber falhou (%s)", exc)
 
         # ── 3. Tesseract OCR via PyMuPDF + pytesseract ───────────────────────
         if _PYMUPDF_AVAILABLE and _PYTESSERACT_AVAILABLE:
             try:
                 tesseract_docs = self._extract_text_via_tesseract(file_path, original_filename)
-                combined_tesseract = " ".join(d.page_content for d in tesseract_docs)
-                if len(combined_tesseract.strip()) > 200 and not self._is_text_garbled(combined_tesseract):
-                    logger.info("[ingest] Tesseract OCR OK (%d chars, %d páginas)",
-                                len(combined_tesseract), len(tesseract_docs))
-                    return tesseract_docs
-                logger.warning("[ingest] Tesseract OCR retornou pouco conteúdo — tentando Vision OCR")
+                quality = self._accept_extraction(tesseract_docs, "tesseract_ocr")
+                if quality:
+                    logger.info("[ingest] Tesseract OCR OK — %.0f palavras/página",
+                                quality.mean_words_per_page)
+                    return tesseract_docs, "tesseract_ocr", quality
             except Exception as exc:
-                logger.warning("[ingest] Tesseract OCR falhou (%s) — tentando Vision OCR", exc)
+                logger.warning("[ingest] Tesseract OCR falhou (%s)", exc)
+        else:
+            # Sem Tesseract a cascata pula direto para o Vision, que custa por
+            # página — vale deixar registrado por que o custo subiu.
+            logger.warning(
+                "[ingest] Tesseract indisponível (pymupdf=%s, pytesseract=%s) — "
+                "cascata seguirá para Vision OCR, que tem custo por página",
+                _PYMUPDF_AVAILABLE, _PYTESSERACT_AVAILABLE,
+            )
 
         # ── 4. Vision OCR via GPT-4o-mini + PyMuPDF (último recurso) ─────────
         if _PYMUPDF_AVAILABLE:
             try:
                 vision_docs = self._extract_text_via_vision(file_path, original_filename)
-                combined_vision = " ".join(d.page_content for d in vision_docs)
-                if len(combined_vision.strip()) > 200:
-                    logger.info("[ingest] Vision OCR OK (%d chars, %d páginas)",
-                                len(combined_vision), len(vision_docs))
-                    return vision_docs
-                logger.warning("[ingest] Vision OCR retornou pouco conteúdo — usando PyPDFLoader original")
+                quality = self._accept_extraction(vision_docs, "vision_ocr")
+                if quality:
+                    logger.info("[ingest] Vision OCR OK — %.0f palavras/página",
+                                quality.mean_words_per_page)
+                    return vision_docs, "vision_ocr", quality
+            except ExtractionCostLimitExceeded:
+                raise
             except Exception as exc:
-                logger.error("[ingest] Vision OCR falhou (%s) — usando PyPDFLoader original", exc)
+                logger.error("[ingest] Vision OCR falhou (%s)", exc)
 
-        return raw_docs
+        # Nenhum estágio produziu qualidade adequada. Devolve a primeira
+        # tentativa com o veredito negativo — o chamador deve falhar, não gravar.
+        final_quality = assess_extraction([d.page_content for d in raw_docs])
+        logger.error("[ingest] cascata esgotada sem qualidade adequada — %s", final_quality.reason)
+        return raw_docs, "pypdf", final_quality
 
     def _extract_text_via_tesseract(self, file_path: str, original_filename: str) -> List[Document]:
         """Extrai texto via Tesseract OCR (PyMuPDF renderiza → PIL → pytesseract).
@@ -333,6 +421,18 @@ class RAGService:
         docs: List[Document] = []
         pdf = pymupdf.open(file_path)
         total_pages = len(pdf)
+
+        # Teto de custo: cada página é uma chamada de API paga. Ultrapassar o
+        # limite falha explicitamente — processar só as N primeiras entregaria
+        # um documento parcial rotulado como completo.
+        if total_pages > OCR_MAX_PAGES:
+            pdf.close()
+            raise ExtractionCostLimitExceeded(
+                f"O documento tem {total_pages} páginas e exigiria OCR por página, "
+                f"acima do limite configurado de {OCR_MAX_PAGES} (OCR_MAX_PAGES). "
+                f"Nenhuma página foi processada."
+            )
+
         logger.info("[vision_ocr] iniciando OCR de %d páginas: %s", total_pages, original_filename)
 
         for page_num, page in enumerate(pdf):
@@ -352,7 +452,9 @@ class RAGService:
                     },
                     {"type": "text", "text": prompt_text},
                 ])
-                resp = self.llm.invoke([message])
+                # Timeout por página: sem ele, uma chamada travada bloqueia a
+                # ingestão inteira indefinidamente.
+                resp = self.llm.invoke([message], timeout=OCR_PAGE_TIMEOUT_SECONDS)
                 extracted = resp.content.strip()
                 if extracted:
                     docs.append(Document(
@@ -371,11 +473,17 @@ class RAGService:
         return docs
 
     def _validate_pdf_quality(self, docs: List[Document]) -> bool:
-        """Valida se PDF extraído tem conteúdo mínimo: > 50 caracteres, > 0 páginas."""
+        """Valida se o PDF extraído tem conteúdo utilizável.
+
+        O critério de densidade fica em `assess_extraction`, aplicado durante a
+        cascata em `_load_pdf_with_fallback` — aqui resta apenas a checagem
+        estrutural de que existe documento e texto. Manter as duas separadas
+        evita avaliar a mesma coisa duas vezes com limiares divergentes.
+        """
         if not docs:
             return False
         total_chars = sum(len(doc.page_content) for doc in docs)
-        return total_chars > 50 and len(docs) > 0
+        return total_chars > 50
 
     def _filter_chunks(self, docs: List[Document]) -> List[Document]:
         """Remove chunks muito curtos ou sem valor científico."""

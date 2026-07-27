@@ -195,9 +195,14 @@ async def upload_admin(
             temp_file.write(content)
         result = await rag_service.ingest_pdf(temp_path, file.filename)
         logger.info(f"[upload_admin] Upload concluído: {result.get('status')}")
+        from fastapi.responses import JSONResponse
         if result.get('status') == 'already_exists':
-            from fastapi.responses import JSONResponse
             return JSONResponse(status_code=409, content=result)
+        # Extração incompleta e estouro do teto de OCR são falhas do documento
+        # enviado, não erros do servidor — 422 deixa isso explícito para o
+        # usuário, em vez de aceitar silenciosamente um documento inútil.
+        if result.get('status') in ('extraction_failed', 'extraction_cost_limit', 'invalid_pdf'):
+            return JSONResponse(status_code=422, content=result)
         return result
     except HTTPException:
         raise
@@ -702,7 +707,6 @@ def _normalize_delete_response(original_file_id: str, result: Any) -> Dict[str, 
             'original_file_id': result.get('original_file_id', original_file_id),
             'original_file_name': result.get('original_file_name', original_file_id),
             'documents_deleted': result.get('documents_deleted', 0),
-            'ingestion_logs_deleted': result.get('ingestion_logs_deleted', 0),
             'storage_deleted': result.get('storage_deleted', False),
             'storage_bucket': result.get('storage_bucket', None),
             'storage_path': result.get('storage_path', None),
@@ -714,7 +718,6 @@ def _normalize_delete_response(original_file_id: str, result: Any) -> Dict[str, 
             'original_file_id': original_file_id,
             'original_file_name': original_file_id,
             'documents_deleted': 0,
-            'ingestion_logs_deleted': 0,
             'storage_deleted': False,
             'storage_bucket': None,
             'storage_path': None,
@@ -727,7 +730,6 @@ def _normalize_cleanup_response(result: Any) -> Dict[str, Any]:
         return {
             'total_files_processed': result.get('total_files_processed', 0),
             'total_documents_deleted': result.get('total_documents_deleted', 0),
-            'total_ingestion_logs_deleted': result.get('total_ingestion_logs_deleted', 0),
             'total_storage_deleted': result.get('total_storage_deleted', 0),
             'dry_run': result.get('dry_run', False),
             'status': result.get('status', 'success'),
@@ -737,7 +739,6 @@ def _normalize_cleanup_response(result: Any) -> Dict[str, Any]:
         return {
             'total_files_processed': 0,
             'total_documents_deleted': 0,
-            'total_ingestion_logs_deleted': 0,
             'total_storage_deleted': 0,
             'dry_run': False,
             'status': 'success',
