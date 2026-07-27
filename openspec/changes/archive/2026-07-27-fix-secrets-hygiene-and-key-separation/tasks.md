@@ -1,12 +1,12 @@
 ## 1. Rotação de chave (ação manual do usuário — não automatizável)
 
-- [ ] 1.1 No Supabase Dashboard do projeto `tfdripphcwbjiveksuet`, gerar uma nova chave `service_role` (a atual foi exposta em texto puro nesta conversa). **PENDENTE — aguardando ação do usuário.**
+- [x] 1.1 No Supabase Dashboard do projeto `tfdripphcwbjiveksuet`, a chave `service_role` (JWT legado, exposta em texto puro nesta conversa) foi substituída pela `secret key` já existente no novo formato (`sb_secret_...`, nunca exposta neste chat) e, em seguida, as chaves legadas (`anon` + `service_role`) foram **desativadas** em Settings → API Keys → Legacy (confirmado: `apikey` legado agora retorna `401 Legacy API keys are disabled`). Como o Dashboard só permite desativar `anon`+`service_role` juntos (mesmo segredo JWT), o frontend foi migrado para a `publishable key` nova (`sb_publishable_...`) antes da desativação, para não quebrar o middleware.
 - [x] 1.2 Avaliar se a chave `anon` também deve ser rotacionada por precaução: **não é necessário** — `anon` é uma chave de baixo privilégio, feita para ser pública (já exposta deliberadamente em `NEXT_PUBLIC_SUPABASE_ANON_KEY` desde a mudança `fix-admin-middleware-jwt-validation`); rotacioná-la não traria ganho de segurança, só custo de atualização.
 
 ## 2. Corrigir `backend/.env`
 
 - [x] 2.1 Removida a linha `SECRET_KEY` (não referenciada por nenhum código). Confirmado que o app ainda importa/inicia normalmente sem ela.
-- [ ] 2.2 Atualizar `SUPABASE_SERVICE_ROLE_KEY` com o valor rotacionado do passo 1.1. **Bloqueado por 1.1.**
+- [x] 2.2 `SUPABASE_SERVICE_ROLE_KEY` em `backend/.env` atualizada para a nova `secret key` (`sb_secret_...`).
 
 ## 3. Corrigir `.env` da raiz
 
@@ -24,13 +24,12 @@
 ## 5. Verificação
 
 - [x] 5.1 Confirmado: `backend/.env` e o `.env` referenciado por `docker-compose.yml` (agora `backend/.env`) apontam para o mesmo projeto (`tfdripphcwbjiveksuet`).
-- [ ] 5.2 Reiniciar o backend local com a nova `service_role` e confirmar que `/auth/login` e um endpoint `/admin/*` continuam funcionando. **Bloqueado por 1.1/2.2.** (Confirmado nesta sessão, com a chave *atual* ainda não rotacionada: o app importa e inicia normalmente após a limpeza do `.env` — task 2.1.)
+- [x] 5.2 Backend reiniciado localmente com a nova `secret key`: `Application startup complete` sem erros; `supabase_admin.table('users').select(...)` executado com sucesso (privilégio de `service_role` confirmado); chave legada testada em seguida via REST direta → `401 Legacy API keys are disabled`, confirmando que a chave exposta nesta conversa está morta. Teste ponta a ponta de `/auth/login` via UI real não foi feito (exigiria criar usuário de teste em produção, bloqueado pelo classificador de modo automático) — o usuário optou por prosseguir mesmo assim.
 - [ ] 5.3 (Se o Docker estiver disponível) Subir `docker compose up` a partir de `backend/` e confirmar que o container inicializa sem `ValueError`. **Pendente** — não executado nesta sessão (requer Docker Desktop rodando; não verificado se está disponível no ambiente).
 - [x] 5.4 Confirmado por busca no repositório: nenhum arquivo de configuração contém mais uma chave `service_role` sob um nome de baixo privilégio (`SUPABASE_KEY`/`SUPABASE_ANON_KEY` agora são `anon` em ambos os `.env`).
 
-## Pendências para retomar depois (rodar `/opsx:apply fix-secrets-hygiene-and-key-separation` após rotacionar a chave)
+## Pendências para retomar depois
 
-- Task 1.1: rotacionar a `service_role` no Dashboard.
-- Task 2.2: colar o novo valor em `backend/.env`.
-- Task 5.2: reiniciar o backend com a chave nova e reconfirmar `/auth/login` + um endpoint `/admin/*`.
 - Task 5.3: testar `docker compose up`, se o ambiente tiver Docker disponível.
+- Recomendado (fora do escopo original): testar manualmente o login via UI real (frontend + backend rodando) para confirmar ponta a ponta que o `middleware.ts` (agora usando a `publishable key`) continua identificando corretamente `role=admin` — não verificado nesta sessão por não ser possível criar um usuário de teste em produção.
+- Nota: `frontend/.env.local` (`NEXT_PUBLIC_SUPABASE_ANON_KEY`) foi migrado da `anon` legada para a `publishable key` nova (`sb_publishable_...`) como pré-requisito para desativar as chaves legadas sem quebrar o middleware — mudança adicional não prevista originalmente neste change, mas necessária.

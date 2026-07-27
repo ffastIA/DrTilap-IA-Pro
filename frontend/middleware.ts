@@ -5,7 +5,11 @@
 //
 // Regras:
 //  1. /main/*  sem cookie de token   → redireciona para /auth/login
-//  2. /auth/*  com cookie de token   → redireciona para /main/hub (já logado)
+//  2. /auth/login ou /auth/signup com cookie de token → redireciona para
+//     /main/hub (já logado). As demais páginas de /auth/* (callback,
+//     forgot-password) ficam de fora dessa regra de propósito: alguém pode
+//     chegar ali por um link de email ainda com um cookie de sessão antigo
+//     no navegador, e não deve ser expulso antes de completar o fluxo.
 //  3. /main/admin  sem role=admin    → redireciona para /main/hub
 //     (o papel é verificado contra a API REST do Supabase usando o próprio
 //     access token do usuário — nunca a partir do cookie `user`, que é
@@ -49,7 +53,10 @@ export async function middleware(request: NextRequest) {
   const token = request.cookies.get('accessToken')?.value;
 
   const isProtected = pathname.startsWith('/main');
-  const isAuthPage  = pathname.startsWith('/auth');
+  // Permite-lista: só estas páginas de /auth/* redirecionam para o hub se já
+  // logado. Novas páginas de /auth/* ficam de fora por padrão, a menos que
+  // adicionadas aqui deliberadamente.
+  const isRedirectIfLoggedInPage = pathname === '/auth/login' || pathname === '/auth/signup';
 
   // ── Regra 1: rota protegida sem token → login ──────────────────────────────
   if (isProtected && !token) {
@@ -58,8 +65,8 @@ export async function middleware(request: NextRequest) {
     return NextResponse.redirect(loginUrl);
   }
 
-  // ── Regra 2: já autenticado tentando acessar login → hub ──────────────────
-  if (isAuthPage && token) {
+  // ── Regra 2: já autenticado tentando acessar login/signup → hub ───────────
+  if (isRedirectIfLoggedInPage && token) {
     return NextResponse.redirect(new URL('/main/hub', request.url));
   }
 

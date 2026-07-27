@@ -51,3 +51,8 @@ Tesseract/
 
 # PDFs dos documentos da base RAG (arquivos grandes — manter fora do repositório)
 backend/docs/*.pdf
+
+# CA bundle local gerado a partir do repositório de certificados do Windows
+# (necessário só em ambientes atrás de proxy de inspeção TLS — ver SSL_CERT_FILE
+# em backend/.env.example). Específico da máquina, nunca commitar.
+backend/ca-bundle-windows.pem

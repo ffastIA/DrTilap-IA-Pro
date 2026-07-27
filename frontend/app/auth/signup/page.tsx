@@ -1,38 +1,37 @@
-﻿// CAMINHO: frontend/app/auth/login/page.tsx
+// CAMINHO: frontend/app/auth/signup/page.tsx
 
 'use client';
 
 import { useState } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
-import { useLoginMutation } from '@/hooks/useLoginMutation';
-import { useResendConfirmationMutation } from '@/hooks/useResendConfirmationMutation';
+import { useSignupMutation } from '@/hooks/useSignupMutation';
 
-export default function LoginPage() {
+export default function SignupPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [validationError, setValidationError] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [successMessage, setSuccessMessage] = useState('');
-  const [showResendConfirmation, setShowResendConfirmation] = useState(false);
-  const [resendMessage, setResendMessage] = useState('');
 
-  const router = useRouter();
-  const loginMutation = useLoginMutation();
-  const resendConfirmationMutation = useResendConfirmationMutation();
+  const signupMutation = useSignupMutation();
 
   const validateForm = (): boolean => {
     if (!email.trim()) {
       setValidationError('O email é obrigatório.');
       return false;
     }
-    if (!password) {
-      setValidationError('A senha é obrigatória.');
-      return false;
-    }
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(email)) {
       setValidationError('Por favor, insira um email válido.');
+      return false;
+    }
+    if (!password || password.length < 6) {
+      setValidationError('A senha deve ter pelo menos 6 caracteres.');
+      return false;
+    }
+    if (password !== confirmPassword) {
+      setValidationError('As senhas não coincidem.');
       return false;
     }
     setValidationError('');
@@ -46,36 +45,18 @@ export default function LoginPage() {
     setIsSubmitting(true);
     setValidationError('');
     setSuccessMessage('');
-    setShowResendConfirmation(false);
-    setResendMessage('');
 
-    loginMutation.mutate(
+    signupMutation.mutate(
       { email: email.trim(), password },
       {
-        onSuccess: () => {
-          setSuccessMessage('Login realizado com sucesso! Redirecionando...');
-          setTimeout(() => {
-            router.push('/main/hub');
-          }, 2000);
+        onSuccess: (data) => {
+          setSuccessMessage(data.message);
         },
         onError: (error) => {
           setValidationError(error.message);
-          setShowResendConfirmation(error.code === 'email_not_confirmed');
         },
         onSettled: () => {
           setIsSubmitting(false);
-        },
-      }
-    );
-  };
-
-  const handleResendConfirmation = () => {
-    setResendMessage('');
-    resendConfirmationMutation.mutate(
-      { email: email.trim() },
-      {
-        onSuccess: (data) => {
-          setResendMessage(data.message);
         },
       }
     );
@@ -86,14 +67,13 @@ export default function LoginPage() {
       <div className="max-w-md w-full space-y-8 bg-white p-8 rounded-2xl shadow-xl border border-gray-200">
         <div>
           <div className="mx-auto h-16 w-16 bg-gradient-to-r from-green-400 to-blue-500 rounded-2xl flex items-center justify-center mb-6">
-            {/* Logo ou ícone preservado, ajuste se houver */}
             <span className="text-2xl font-bold text-white">DT</span>
           </div>
           <h2 className="mt-6 text-center text-3xl font-bold tracking-tight text-gray-900">
-            Entrar no Sistema
+            Criar Conta
           </h2>
           <p className="mt-2 text-center text-sm text-gray-600">
-            Acesse sua conta DrTilápia
+            Cadastre-se no DrTilápia
           </p>
         </div>
         <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
@@ -124,33 +104,33 @@ export default function LoginPage() {
                 type="password"
                 required
                 className="appearance-none rounded-xl relative block w-full px-4 py-3 border border-gray-300 placeholder-gray-500 text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 sm:text-sm transition duration-200"
-                placeholder="Digite sua senha"
+                placeholder="Pelo menos 6 caracteres"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
+                disabled={isSubmitting}
+              />
+            </div>
+            <div>
+              <label htmlFor="confirmPassword" className="block text-sm font-medium text-gray-700 mb-2">
+                Confirmar senha
+              </label>
+              <input
+                id="confirmPassword"
+                name="confirmPassword"
+                type="password"
+                required
+                className="appearance-none rounded-xl relative block w-full px-4 py-3 border border-gray-300 placeholder-gray-500 text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 sm:text-sm transition duration-200"
+                placeholder="Digite a senha novamente"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
                 disabled={isSubmitting}
               />
             </div>
           </div>
 
           {validationError && (
-            <div className="bg-red-50 border border-red-200 text-red-800 px-4 py-3 rounded-xl text-sm space-y-2">
-              <p>{validationError}</p>
-              {showResendConfirmation && (
-                <button
-                  type="button"
-                  onClick={handleResendConfirmation}
-                  disabled={resendConfirmationMutation.isPending}
-                  className="font-medium underline text-red-800 hover:text-red-900 disabled:opacity-50"
-                >
-                  {resendConfirmationMutation.isPending ? 'Reenviando...' : 'Reenviar confirmação'}
-                </button>
-              )}
-            </div>
-          )}
-
-          {resendMessage && (
-            <div className="bg-green-50 border border-green-200 text-green-800 px-4 py-3 rounded-xl text-sm">
-              {resendMessage}
+            <div className="bg-red-50 border border-red-200 text-red-800 px-4 py-3 rounded-xl text-sm">
+              {validationError}
             </div>
           )}
 
@@ -166,23 +146,10 @@ export default function LoginPage() {
               disabled={isSubmitting}
               className="group relative w-full flex justify-center py-3 px-4 border border-transparent text-sm font-bold rounded-xl text-white bg-gradient-to-r from-green-500 to-blue-600 hover:from-green-600 hover:to-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500 transition duration-200 disabled:opacity-50 disabled:cursor-not-allowed shadow-lg hover:shadow-xl"
             >
-              {isSubmitting ? 'Entrando...' : 'Entrar no Sistema'}
+              {isSubmitting ? 'Criando conta...' : 'Criar Conta'}
             </button>
           </div>
-
-          <div className="flex items-center justify-between text-sm">
-            <Link href="/auth/signup" className="font-medium text-blue-600 hover:text-blue-500">
-              Criar conta
-            </Link>
-            <Link href="/auth/forgot-password" className="font-medium text-blue-600 hover:text-blue-500">
-              Esqueci minha senha
-            </Link>
-          </div>
         </form>
-
-        <div className="text-center text-xs text-gray-500 mt-6">
-          Este sistema utiliza Supabase para autenticação segura e proteção de dados dos usuários.
-        </div>
 
         <div className="mt-8">
           <div className="relative">
@@ -190,15 +157,15 @@ export default function LoginPage() {
               <div className="w-full border-t border-gray-300" />
             </div>
             <div className="relative flex justify-center text-sm">
-              <span className="px-2 bg-white text-gray-500">Ou retorne para a página inicial</span>
+              <span className="px-2 bg-white text-gray-500">Já tem conta?</span>
             </div>
           </div>
           <div className="mt-6">
             <Link
-              href="/"
+              href="/auth/login"
               className="font-medium text-blue-600 hover:text-blue-500 text-sm flex items-center justify-center gap-1"
             >
-              ← Voltar ao Início
+              Entrar
             </Link>
           </div>
         </div>

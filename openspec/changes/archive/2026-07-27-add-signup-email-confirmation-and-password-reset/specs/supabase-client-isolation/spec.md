@@ -1,8 +1,5 @@
-# supabase-client-isolation Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - defined by change isolate-login-client-and-fix-users-rls. Update Purpose after archiving.
-## Requirements
 ### Requirement: Login does not downgrade the privileged backend client
 Authenticating, registering, or resetting credentials for an end user via any `/auth/*` endpoint (`login`, `signup`, `resend-confirmation`, `forgot-password`, `reset-password`) SHALL NOT change the effective authorization privilege used by the backend's service-role Supabase client (`supabase_admin`) for any other request, concurrent or subsequent.
 
@@ -47,4 +44,3 @@ The backend SHALL construct a fresh, per-request Supabase client for every end-u
 #### Scenario: No other backend operation depends on any auth-call client's identity
 - **WHEN** the codebase is searched for usages of the clients used to perform `sign_in_with_password`, `sign_up`, `resend`, or `reset_password_for_email`
 - **THEN** none of those clients are used for any other purpose (no `.table()`, `.storage()`, or `.rpc()` calls depend on their authorization state)
-

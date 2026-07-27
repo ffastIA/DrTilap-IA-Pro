@@ -10,7 +10,7 @@ from typing import List, Optional, Dict, Any
 from app.database import supabase_admin, get_user_scoped_client
 from app.services.vector_admin_service import vector_admin_service
 from app.services.rag_service import rag_service
-from app.auth.auth_service import auth_service
+from app.auth.auth_service import auth_service, AuthError
 from app.dependencies import get_current_user, get_current_admin_user
 from app.services.video_service import video_service
 from app.video_schemas import VideoUploadResponse, VideoListResponse, VideoDeleteResponse
@@ -55,6 +55,24 @@ class LoginResponse(BaseModel):
     token_type: str
     user: LoginUserResponse
 
+class SignupRequest(BaseModel):
+    email: str
+    password: str
+
+class MessageResponse(BaseModel):
+    message: str
+
+class ResendConfirmationRequest(BaseModel):
+    email: str
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+class ResetPasswordRequest(BaseModel):
+    access_token: str
+    refresh_token: str
+    new_password: str
+
 class ChatRequest(BaseModel):
     message: str
     history: List[List[str]] = []
@@ -68,6 +86,7 @@ _ALLOWED_ORIGINS = [
     for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
     if o.strip()
 ]
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS,
@@ -85,25 +104,65 @@ async def login(data: LoginRequest):
     try:
         logger.info("[main.login] chamando auth_service.login para email=%s", data.email)
         result = await auth_service.login(data.email, data.password)
-        logger.info("[main.login] auth_service.login retornou para email=%s", data.email)
-        if result is None:
-            logger.warning("[main.login] auth_service retornou None para email=%s", data.email)
-            raise HTTPException(status_code=401, detail="Invalid credentials")
         access_token = result['access_token']
         token_type = result['token_type']
         user = result['user']
-        logger.info("[main.login] montando resposta para user_id=%s role=%s", user['id'], user['role'])
         user_response = LoginUserResponse(id=user['id'], email=user['email'], role=user['role'])
         elapsed_seconds = time.perf_counter() - start_time
         logger.info("[main.login] login concluído para email=%s em %.3fs", data.email, elapsed_seconds)
         return LoginResponse(access_token=access_token, token_type=token_type, user=user_response)
+    except AuthError as e:
+        logger.warning("[main.login] AuthError code=%s para email=%s", e.code, data.email)
+        status_code = 403 if e.code == "email_not_confirmed" else 401
+        raise HTTPException(status_code=status_code, detail=e.code)
     except HTTPException:
-        logger.exception("[main.login] HTTPException durante login para email=%s", data.email)
         raise
     except Exception:
         logger.exception("[main.login] exceção inesperada para email=%s", data.email)
-        logger.exception("Erro no login")
         raise HTTPException(status_code=500, detail="Erro interno do servidor")
+
+@app.post("/auth/signup", response_model=MessageResponse, status_code=201)
+async def signup(data: SignupRequest):
+    generic_message = "Se o e-mail informado for válido, você receberá um link de confirmação em instantes."
+    try:
+        email_redirect_to = f"{FRONTEND_URL}/auth/callback"
+        user = auth_service.signup(data.email, data.password, email_redirect_to)
+        supabase_admin.table("users").upsert(
+            {"id": user["id"], "email": user["email"], "role": "user"}
+        ).execute()
+    except AuthError as e:
+        logger.info("[main.signup] AuthError code=%s para email=%s (resposta genérica mantida)", e.code, data.email)
+    except Exception:
+        logger.exception("[main.signup] erro inesperado para email=%s (resposta genérica mantida)", data.email)
+    return MessageResponse(message=generic_message)
+
+@app.post("/auth/resend-confirmation", response_model=MessageResponse)
+async def resend_confirmation(data: ResendConfirmationRequest):
+    email_redirect_to = f"{FRONTEND_URL}/auth/callback"
+    auth_service.resend_confirmation(data.email, email_redirect_to)
+    return MessageResponse(
+        message="Se o e-mail existir e ainda não tiver sido confirmado, um novo link foi enviado."
+    )
+
+@app.post("/auth/forgot-password", response_model=MessageResponse)
+async def forgot_password(data: ForgotPasswordRequest):
+    redirect_to = f"{FRONTEND_URL}/auth/callback"
+    auth_service.send_password_reset(data.email, redirect_to)
+    return MessageResponse(
+        message="Se o e-mail existir em nossa base, você receberá um link para redefinir sua senha."
+    )
+
+@app.post("/auth/reset-password", response_model=MessageResponse)
+async def reset_password(data: ResetPasswordRequest):
+    try:
+        auth_service.reset_password(data.access_token, data.refresh_token, data.new_password)
+    except AuthError as e:
+        status_code = 422 if e.code == "reset_failed" else 400
+        raise HTTPException(status_code=status_code, detail=e.code)
+    except Exception:
+        logger.exception("[main.reset_password] erro inesperado")
+        raise HTTPException(status_code=500, detail="Erro interno do servidor")
+    return MessageResponse(message="Senha redefinida com sucesso.")
 
 @app.post("/consultoria/chat")
 async def chat(data: ChatRequest, current_user: dict = Depends(get_current_user)):

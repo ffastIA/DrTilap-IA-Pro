@@ -83,3 +83,20 @@ def get_user_scoped_client(access_token: str) -> Client:
     )
     client.postgrest.auth(access_token)
     return client
+
+
+def get_session_scoped_client(access_token: str, refresh_token: str) -> Client:
+    """Cria um cliente Supabase novo com sessão GoTrue completa.
+
+    Diferente de `get_user_scoped_client` (que só autentica consultas
+    PostgREST), este estabelece uma sessão de auth completa via
+    `client.auth.set_session(...)` — necessário para chamadas que mutam o
+    próprio usuário autenticado (ex.: `update_user` ao redefinir senha).
+    """
+    client = create_client(
+        SUPABASE_URL,
+        SUPABASE_KEY,
+        options=ClientOptions(httpx_client=httpx.Client(verify=_resolve_ssl_verify())),
+    )
+    client.auth.set_session(access_token, refresh_token)
+    return client

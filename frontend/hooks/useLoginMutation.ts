@@ -20,6 +20,19 @@ interface LoginResponse {
   user?: User;
 }
 
+const KNOWN_ERROR_MESSAGES: Record<string, string> = {
+  invalid_credentials: 'Credenciais inválidas. Verifique seu email e senha e tente novamente.',
+  email_not_confirmed: 'Confirme seu e-mail antes de entrar. Verifique sua caixa de entrada.',
+};
+
+export class LoginError extends Error {
+  code?: string;
+  constructor(message: string, code?: string) {
+    super(message);
+    this.code = code;
+  }
+}
+
 function normalizeErrorMessage(value: unknown): string {
   if (typeof value === 'string') {
     return value;
@@ -49,12 +62,19 @@ export const useLoginMutation = () => {
   const [isPending, setIsPending] = useState(false);
   const [isError, setIsError] = useState(false);
   const [isSuccess, setIsSuccess] = useState(false);
-  const [error, setError] = useState<Error | null>(null);
+  const [error, setError] = useState<LoginError | null>(null);
   const [data, setData] = useState<LoginResponse | null>(null);
 
   const { setAuth } = useAuthStore();
 
-  const mutate = async (credentials: LoginRequest) => {
+  const mutate = async (
+    credentials: LoginRequest,
+    options?: {
+      onSuccess?: (data: LoginResponse) => void;
+      onError?: (error: LoginError) => void;
+      onSettled?: () => void;
+    }
+  ) => {
     setIsPending(true);
     setIsError(false);
     setIsSuccess(false);
@@ -70,13 +90,18 @@ export const useLoginMutation = () => {
       setAuth(response.data.access_token, user);
       setData(response.data);
       setIsSuccess(true);
+      options?.onSuccess?.(response.data);
     } catch (err: any) {
-      const normalizedError = new Error(normalizeErrorMessage(err.response?.data ?? err));
+      const rawDetail = err.response?.data?.detail;
+      const code = typeof rawDetail === 'string' ? rawDetail : undefined;
+      const message = (code && KNOWN_ERROR_MESSAGES[code]) || normalizeErrorMessage(err.response?.data ?? err);
+      const normalizedError = new LoginError(message, code);
       setError(normalizedError);
       setIsError(true);
-      throw normalizedError;
+      options?.onError?.(normalizedError);
     } finally {
       setIsPending(false);
+      options?.onSettled?.();
     }
   };
 
