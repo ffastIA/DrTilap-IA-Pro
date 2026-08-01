@@ -1,7 +1,7 @@
 // CAMINHO: frontend/hooks/useRagAdmin.ts
 import { useCallback, useEffect, useState } from 'react';
-import { clearRagDatabase, deleteRagDocument, listRagDocuments, reindexRagDatabase, uploadRagDocuments } from '@/lib/ragAdminApi';
-import type { RagAdminError, RagClearResponse, RagDeleteResponse, RagItem, RagReindexResponse, RagUploadResponse } from '@/types/rag-admin';
+import { clearRagDatabase, deleteRagDocument, listRagDocuments, uploadRagDocuments } from '@/lib/ragAdminApi';
+import type { RagAdminError, RagClearResponse, RagDeleteResponse, RagItem, RagUploadResponse } from '@/types/rag-admin';
 
 function normalizeUiError(error: unknown): RagAdminError {
   if (error && typeof error === 'object' && 'message' in error) {
@@ -20,20 +20,18 @@ export default function useRagAdmin() {
   const [page, setPage] = useState<number>(1);
   const [limit, setLimit] = useState<number>(0);
   const [selectedItem, setSelectedItem] = useState<RagItem | null>(null);
-  const [criticalAction, setCriticalAction] = useState<'delete_item' | 'clear_all' | 'reindex' | null>(null);
+  const [criticalAction, setCriticalAction] = useState<'delete_item' | 'clear_all' | null>(null);
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState<boolean>(false);
   const [isLoadingList, setIsLoadingList] = useState<boolean>(false);
   const [isUploading, setIsUploading] = useState<boolean>(false);
   const [isDeleting, setIsDeleting] = useState<boolean>(false);
   const [isClearing, setIsClearing] = useState<boolean>(false);
-  const [isReindexing, setIsReindexing] = useState<boolean>(false);
   const [listError, setListError] = useState<RagAdminError | null>(null);
   const [operationMessage, setOperationMessage] = useState<string>('');
   const [operationError, setOperationError] = useState<RagAdminError | null>(null);
   const [lastUploadResponse, setLastUploadResponse] = useState<RagUploadResponse | null>(null);
   const [lastDeleteResponse, setLastDeleteResponse] = useState<RagDeleteResponse | null>(null);
   const [lastClearResponse, setLastClearResponse] = useState<RagClearResponse | null>(null);
-  const [lastReindexResponse, setLastReindexResponse] = useState<RagReindexResponse | null>(null);
 
   const refreshList = useCallback(async () => {
     setListError(null);
@@ -144,21 +142,6 @@ export default function useRagAdmin() {
     }
   }, [refreshList]);
 
-  const reindexDatabase = useCallback(async () => {
-    setIsReindexing(true);
-    setOperationMessage('');
-    setOperationError(null);
-    try {
-      const response = await reindexRagDatabase();
-      setLastReindexResponse(response);
-      setOperationMessage('Reindexação iniciada com sucesso.');
-    } catch (error) {
-      setOperationError(normalizeUiError(error));
-    } finally {
-      setIsReindexing(false);
-    }
-  }, []);
-
   const resetFeedback = useCallback(() => {
     setOperationMessage('');
     setOperationError(null);
@@ -176,21 +159,18 @@ export default function useRagAdmin() {
     isUploading,
     isDeleting,
     isClearing,
-    isReindexing,
     listError,
     operationMessage,
     operationError,
     lastUploadResponse,
     lastDeleteResponse,
     lastClearResponse,
-    lastReindexResponse,
     refreshList,
     uploadFiles,
     openDeleteModal,
     closeDeleteModal,
     deleteSelectedItem,
     clearDatabase,
-    reindexDatabase,
     resetFeedback,
   };
 }

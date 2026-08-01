@@ -1,14 +1,13 @@
 // CAMINHO: frontend/lib/ragAdminApi.ts
 
 import api from '@/lib/api';
-import type { RagAdminError, RagClearResponse, RagDeletePayload, RagDeleteResponse, RagItem, RagListResponse, RagReindexPayload, RagReindexResponse, RagUploadResponse } from '@/types/rag-admin';
+import type { RagAdminError, RagClearResponse, RagDeletePayload, RagDeleteResponse, RagItem, RagListResponse, RagUploadResponse } from '@/types/rag-admin';
 
 export const RAG_ADMIN_ENDPOINTS = {
   LIST: '/admin/vector-base/files',
   UPLOAD: '/admin/upload',
   DELETE_BASE: '/admin/vector-base/files',
   CLEAR: '/admin/vector-base/cleanup',
-  REINDEX: '/admin/vector-base/reindex',
 } as const;
 
 export type RagOperationStatusResponse = {
@@ -252,36 +251,6 @@ export async function clearRagDatabase(confirm?: boolean): Promise<RagClearRespo
   };
 }
 
-export async function reindexRagDatabase(
-  payload?: RagReindexPayload
-): Promise<RagReindexResponse> {
-  const body = {
-    confirmation_phrase: 'CONFIRMADO',
-    original_file_ids: [],
-  };
-
-  const response = await api.post(RAG_ADMIN_ENDPOINTS.REINDEX, body);
-  const resBody = extractBody(response);
-  const reindexed = !!getFirstDefined(resBody?.success, resBody?.reindexed, false);
-  const count = getFirstDefined<number>(
-    resBody?.count,
-    resBody?.reindexed_count,
-    resBody?.total,
-    0
-  );
-  const status = getFirstDefined<'completed' | 'in_progress'>(
-    resBody?.status
-  ) || 'completed';
-  const jobId = resBody?.jobId;
-
-  return {
-    reindexed,
-    count,
-    status,
-    ...(jobId && { jobId }),
-  };
-}
-
 export async function getRagOperationStatus(jobId: string): Promise<RagOperationStatusResponse> {
   throw new Error('Status de operação não está disponível no backend atual.');
 }
@@ -291,7 +260,6 @@ export const ragAdminApi = {
   uploadRagDocuments,
   deleteRagDocument,
   clearRagDatabase,
-  reindexRagDatabase,
   getRagOperationStatus,
 } as const;
 

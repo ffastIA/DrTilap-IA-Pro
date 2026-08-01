@@ -71,28 +71,6 @@ class CleanupVectorBaseResponse(BaseModel):
     status: str
     message: str
 
-class ReindexFileRequest(BaseModel):
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
-    confirmation_phrase: Optional[str] = None
-    original_file_ids: Optional[List[str]] = None
-    file_ids: Optional[List[str]] = None
-
-    @model_validator(mode="after")
-    def validate_fields(self):
-        if self.file_ids and not self.original_file_ids:
-            self.original_file_ids = self.file_ids
-        if not self.confirmation_phrase or self.confirmation_phrase.strip() == "":
-            self.confirmation_phrase = "CONFIRMADO"
-        return self
-
-class ReindexFileResponse(BaseModel):
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
-    processed_files: int = 0
-    failed_files: int = 0
-    total_chunks_created: int = 0
-    status: str
-    message: str
-
 class VectorChunk(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
     id: str

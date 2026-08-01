@@ -4,7 +4,7 @@
 
 import React, { useState, useRef, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
-import { useChat } from '@/hooks/useChat';
+import { useChat, ChatSource } from '@/hooks/useChat';
 import ChatMessage from '@/components/ChatMessage';
 import LoadingSpinner from '@/components/LoadingSpinner';
 import Button from '@/components/Button';
@@ -14,6 +14,7 @@ interface Message {
   id: string;
   text: string;
   sender: string;
+  sources?: ChatSource[];
 }
 
 export default function Consultoria() {
@@ -105,6 +106,7 @@ export default function Consultoria() {
                 key={msg.id}
                 message={msg.text}
                 isUser={msg.sender === 'user'}
+                sources={msg.sources}
               />
             ))
           )}

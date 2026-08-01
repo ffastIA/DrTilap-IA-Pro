@@ -9,7 +9,7 @@ export type RagAdminError = {
 
 export type OperationStatus = 'idle' | 'loading' | 'success' | 'error';
 
-export type CriticalActionType = 'delete_item' | 'clear_all' | 'reindex';
+export type CriticalActionType = 'delete_item' | 'clear_all';
 
 // Tipos brutos do backend (flexíveis para adaptação)
 export interface RawRagItem {
@@ -53,14 +53,6 @@ export interface RawRagClearResponse {
   [key: string]: any;
 }
 
-export interface RawRagReindexResponse {
-  reindexed: boolean;
-  count?: number;
-  status?: 'completed' | 'in_progress';
-  jobId?: string; // Para reindexação assíncrona
-  [key: string]: any;
-}
-
 // Tipos normalizados para UI (estáveis e padronizados)
 export interface RagItem {
   id: string;
@@ -95,20 +87,12 @@ export interface RagClearResponse {
   count: number;
 }
 
-export interface RagReindexResponse {
-  reindexed: boolean;
-  count: number;
-  status: 'completed' | 'in_progress';
-  jobId?: string;
-}
-
 // Utilitários para adaptação de respostas cruas do backend para objetos de UI
 export type NormalizeRagItem = (raw: RawRagItem) => RagItem;
 export type NormalizeRagListResponse = (raw: RawRagListResponse) => RagListResponse;
 export type NormalizeRagUploadResponse = (raw: RawRagUploadResponse) => RagUploadResponse;
 export type NormalizeRagDeleteResponse = (raw: RawRagDeleteResponse) => RagDeleteResponse;
 export type NormalizeRagClearResponse = (raw: RawRagClearResponse) => RagClearResponse;
-export type NormalizeRagReindexResponse = (raw: RawRagReindexResponse) => RagReindexResponse;
 
 // Payloads de operações
 export interface RagUploadPayload {
@@ -122,10 +106,6 @@ export interface RagDeletePayload {
 
 export interface RagClearPayload {
   confirm: boolean;
-}
-
-export interface RagReindexPayload {
-  fullReindex?: boolean;
 }
 
 // Estados de operação no frontend
@@ -149,11 +129,6 @@ export interface RagAdminState {
   clear: {
     status: OperationStatus;
     response?: RagClearResponse;
-    error?: RagAdminError;
-  };
-  reindex: {
-    status: OperationStatus;
-    response?: RagReindexResponse;
     error?: RagAdminError;
   };
 }

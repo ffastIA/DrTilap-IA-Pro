@@ -73,18 +73,12 @@ def print_retrieval_report(result: Dict[str, Any]) -> None:
 def run_answer_generation(rag_service) -> Dict[str, Any]:
     """Gera resposta com RAG"""
     result = rag_service.get_answer(QUESTION)
-    if isinstance(result, dict):
-        answer_text = (
-            result.get('answer') or
-            result.get('response') or
-            str(result)
-        )
-    else:
-        answer_text = str(result)
+    answer_text = result.answer
     answer_length = len(answer_text)
     return {
         'answer_text': answer_text,
-        'answer_length': answer_length
+        'answer_length': answer_length,
+        'sources': result.sources,
     }
 
 
@@ -96,6 +90,8 @@ def print_answer_report(result: Dict[str, Any]) -> None:
     print(f"Tamanho da resposta: {result['answer_length']} chars")
     print("\nResposta final:")
     print(result['answer_text'])
+    print("\nFontes:")
+    print(result.get('sources', []))
 
 
 def print_success_summary(retrieval_result: Dict[str, Any], answer_result: Dict[str, Any]) -> None:

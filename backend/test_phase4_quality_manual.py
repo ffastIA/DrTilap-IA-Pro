@@ -151,7 +151,9 @@ if __name__ == '__main__':
     graph_response = rag_service.graph.invoke({'question': QUESTION})
 
     print('\nExecutando get_answer...')
-    answer_response = rag_service.get_answer(QUESTION)
+    answer_result = rag_service.get_answer(QUESTION)
+    answer_response = answer_result.answer
+    print(f'Fontes: {answer_result.sources}')
 
     print_final_diagnostic(graph_response, answer_response, coverage)
     print('\nTeste concluído.')

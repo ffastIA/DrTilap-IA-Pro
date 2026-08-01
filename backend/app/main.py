@@ -32,8 +32,6 @@ from app.vector_admin_schemas import (
     DeleteFileResponse,
     CleanupVectorBaseRequest,
     CleanupVectorBaseResponse,
-    ReindexFileRequest,
-    ReindexFileResponse,
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', force=True)
@@ -167,8 +165,8 @@ async def reset_password(data: ResetPasswordRequest):
 @app.post("/consultoria/chat")
 async def chat(data: ChatRequest, current_user: dict = Depends(get_current_user)):
     try:
-        response = rag_service.get_answer(data.message, data.history)
-        return {"answer": response, "sources": []}
+        result = rag_service.get_answer(data.message, data.history)
+        return {"answer": result.answer, "sources": result.sources}
     except HTTPException:
         raise
     except Exception as e:
@@ -288,18 +286,6 @@ async def cleanup_vector_base(request: CleanupVectorBaseRequest, current_user: d
     except Exception as e:
         logger.exception(f"[cleanup_vector_base] Erro")
         raise HTTPException(status_code=500, detail=f"Erro ao executar cleanup: {str(e)}")
-
-@app.post("/admin/vector-base/reindex", response_model=ReindexFileResponse)
-async def reindex_vector_base(request: ReindexFileRequest, current_user: dict = Depends(get_current_admin_user)):
-    try:
-        logger.info(f"[reindex_vector_base] Iniciando reindexação")
-        file_ids = request.original_file_ids or []
-        result = await vector_admin_service.reindex_files(file_ids)
-        normalized = _normalize_reindex_response(request, result)
-        return ReindexFileResponse(**normalized)
-    except Exception as e:
-        logger.exception(f"[reindex_vector_base] Erro")
-        raise HTTPException(status_code=500, detail=f"Erro ao reindexar base: {str(e)}")
 
 # ========== ROTAS VÍDEOS ==========
 
@@ -745,20 +731,3 @@ def _normalize_cleanup_response(result: Any) -> Dict[str, Any]:
             'message': 'Limpeza executada',
         }
 
-def _normalize_reindex_response(request: ReindexFileRequest, result: Any) -> Dict[str, Any]:
-    if isinstance(result, dict):
-        return {
-            'processed_files': result.get('processed_files', len(request.original_file_ids or [])),
-            'failed_files': result.get('failed_files', 0),
-            'total_chunks_created': result.get('total_chunks_created', 0),
-            'status': result.get('status', 'success'),
-            'message': result.get('message', 'Reindexação iniciada'),
-        }
-    else:
-        return {
-            'processed_files': len(request.original_file_ids or []),
-            'failed_files': 0,
-            'total_chunks_created': 0,
-            'status': 'success',
-            'message': 'Reindexação iniciada',
-        }

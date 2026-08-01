@@ -101,7 +101,8 @@ def evaluate_retrieval(service: Any, question: dict, k: int, use_llm_expansion: 
 
 def evaluate_generation(service: Any, question: dict, judge: Any) -> dict:
     started = time.perf_counter()
-    answer = service.get_answer(question["question"], question.get("history") or [])
+    answer_result = service.get_answer(question["question"], question.get("history") or [])
+    answer = answer_result.answer
     elapsed = time.perf_counter() - started
 
     refused = is_refusal(answer)
@@ -117,6 +118,7 @@ def evaluate_generation(service: Any, question: dict, judge: Any) -> dict:
         ),
         "generation_seconds": round(elapsed, 3),
         "answer": answer,
+        "sources": answer_result.sources,
     }
 
     if judge is not None and not out_of_corpus:

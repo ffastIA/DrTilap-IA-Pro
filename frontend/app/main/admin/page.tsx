@@ -50,7 +50,6 @@ export default function AdminPage() {
     isUploading,
     isDeleting,
     isClearing,
-    isReindexing,
     selectedItem,
     isDeleteModalOpen,
     operationMessage,
@@ -61,7 +60,6 @@ export default function AdminPage() {
     closeDeleteModal,
     deleteSelectedItem,
     clearDatabase,
-    reindexDatabase,
     resetFeedback,
   } = useRagAdmin();
 
@@ -153,13 +151,6 @@ export default function AdminPage() {
             className="bg-gray-600 text-white px-6 py-3 rounded-lg hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed font-medium"
           >
             {isLoadingList ? 'Atualizando...' : 'Atualizar Lista'}
-          </button>
-          <button
-            onClick={reindexDatabase}
-            disabled={isReindexing}
-            className="bg-yellow-600 text-white px-6 py-3 rounded-lg hover:bg-yellow-700 disabled:opacity-50 disabled:cursor-not-allowed font-medium"
-          >
-            {isReindexing ? 'Reindexando...' : 'Reindexar Base'}
           </button>
           <button
             onClick={handleClear}

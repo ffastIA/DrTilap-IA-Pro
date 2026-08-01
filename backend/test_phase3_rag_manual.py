@@ -164,8 +164,9 @@ llm_class.invoke = tracked_llm_invoke
 # Passo 12: Chamar get_answer com rastreamento
 print('\nExecutando rag_service.get_answer com rastreamento...')
 try:
-    answer = rag_service.get_answer(QUESTION)
-    print(f'Resposta de get_answer: {answer}')
+    result = rag_service.get_answer(QUESTION)
+    print(f'Resposta de get_answer: {result.answer}')
+    print(f'Fontes: {result.sources}')
 except Exception as e:
     print(f'Erro em get_answer: {e}')
 

@@ -4,8 +4,9 @@ import time
 import json
 import hashlib
 import logging
+import asyncio
 import httpx
-from typing import TypedDict, Dict, Any, List, Literal, Optional, Tuple
+from typing import TypedDict, Dict, Any, List, Literal, Optional, Tuple, NamedTuple
 
 logger = logging.getLogger(__name__)
 from langchain_core.documents import Document
@@ -42,7 +43,18 @@ from langgraph.graph import StateGraph, END
 from app.database import supabase_admin, _resolve_ssl_verify
 from app.utils.pdf_cleaning import clean_loaded_pages, is_editorial_or_low_value, contains_scientific_signal
 from app.utils.extraction_quality import assess_extraction, ExtractionQuality
+from app.utils.chunking import split_pages_continuous
+from app.utils.rag_config import (
+    EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, CHUNK_SIZE, CHUNK_OVERLAP,
+    RETRIEVAL_K, RETRIEVAL_K_RETRY, REFUSAL_FLOOR_SIMILARITY,
+    PRIMARY_RPC_SIMILARITY_THRESHOLD,
+)
 
+
+# Bucket dedicado aos PDFs originais — persistidos para reprocessamento/
+# auditoria futuros, já que a extração/chunking pode mudar e o arquivo
+# temporário de upload é descartado logo após a ingestão.
+RAG_SOURCE_PDFS_BUCKET = os.getenv("RAG_SOURCE_PDFS_BUCKET", "rag-source-pdfs")
 
 # Limites do OCR por página (custo ~US$ 0,002-0,01/página no Vision).
 # Sem teto, um PDF de centenas de páginas gera centenas de chamadas pagas.
@@ -67,6 +79,17 @@ class State(TypedDict):
     language: str
     history: List[List[str]]   # pares [pergunta_humano, resposta_ai]
     question_type: str         # quantitative | conceptual | comparative | methodological
+    insufficient_context: bool  # True quando nenhum chunk atinge o piso de recusa
+    source_docs: List[Dict[str, Any]]  # metadata leve dos chunks usados, para citação
+
+
+class AnswerResult(NamedTuple):
+    """Retorno de `get_answer`: a resposta e as fontes reais que a embasaram.
+
+    Fontes vêm vazias em caso de recusa (nenhum chunk confiável o suficiente).
+    """
+    answer: str
+    sources: List[Dict[str, Any]]
 
 
 class RAGService:
@@ -84,6 +107,8 @@ class RAGService:
 
         self.embeddings = OpenAIEmbeddings(
             openai_api_key=openai_api_key,
+            model=EMBEDDING_MODEL,
+            dimensions=EMBEDDING_DIMENSIONS,
             http_client=_http_client,
             http_async_client=_http_async_client,
         )
@@ -102,24 +127,40 @@ class RAGService:
             table_name="documents"
         )
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=4000,
-            chunk_overlap=500,
-            separators=["\n\n", "\n", ". ", " ", ""]
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            separators=["\n\n", "\n", ". ", " ", ""],
+            add_start_index=True,
         )
-        self.similarity_threshold = float(
-            os.getenv("PRIMARY_RPC_SIMILARITY_THRESHOLD", "0.5")
+        self.similarity_threshold = PRIMARY_RPC_SIMILARITY_THRESHOLD
+        logger.info(
+            "[RAGService] embedding_model=%s embedding_dimensions=%s "
+            "chunk_size=%s chunk_overlap=%s similarity_threshold=%.2f "
+            "retrieval_k=%s retrieval_k_retry=%s refusal_floor_similarity=%.2f",
+            EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, CHUNK_SIZE, CHUNK_OVERLAP,
+            self.similarity_threshold,
+            RETRIEVAL_K, RETRIEVAL_K_RETRY, REFUSAL_FLOOR_SIMILARITY,
         )
-        logger.info("[RAGService] similarity_threshold=%.2f", self.similarity_threshold)
         self.graph = self._build_graph()
 
     # MÉTODO MODIFICADO: ingest_pdf com duplicação + validação (Etapa 1)
     async def ingest_pdf(self, file_path: str, original_filename: str) -> dict:
-        """Ingestão de PDF com detecção de duplicação e validação de qualidade."""
-        try:
-            # Gerar original_file_id como MD5 do NOME do arquivo (não do caminho temp)
-            original_file_id = hashlib.md5(original_filename.encode()).hexdigest()
+        """Ingestão de PDF com detecção de duplicação e validação de qualidade.
 
-            # Verificar se arquivo já foi ingestado
+        Identidade por conteúdo (SHA-256 dos bytes do arquivo, não do nome),
+        PDF original persistido no Storage, e limpeza automática se qualquer
+        etapa de escrita falhar no meio — ver `harden-pdf-ingestion`.
+        """
+        storage_path: Optional[str] = None
+        original_file_id: Optional[str] = None
+        try:
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+            # Hash do CONTEÚDO, não do nome — dois arquivos com nomes iguais
+            # e conteúdos diferentes não colidem; o mesmo arquivo reenviado
+            # com outro nome é reconhecido como já ingerido.
+            original_file_id = hashlib.sha256(file_bytes).hexdigest()
+
             if self._check_file_exists(original_file_id):
                 return {
                     "status": "already_exists",
@@ -128,10 +169,12 @@ class RAGService:
                     "original_file_name": original_filename,
                 }
 
-            # Carregar PDF percorrendo a cascata de extração até obter qualidade adequada
+            # Cascata de extração fora do event loop — pode envolver OCR
+            # (Tesseract/Vision) demorando minutos; sem isso, uma ingestão
+            # longa travaria outras requisições (ex.: chat) no mesmo processo.
             try:
-                raw_docs, extraction_method, quality = self._load_pdf_with_fallback(
-                    file_path, original_filename
+                raw_docs, extraction_method, quality = await asyncio.to_thread(
+                    self._load_pdf_with_fallback, file_path, original_filename
                 )
             except ExtractionCostLimitExceeded as exc:
                 return {
@@ -173,27 +216,61 @@ class RAGService:
 
             original_file_name = original_filename
 
-            # Split em chunks com parâmetros otimizados para documentos científicos
-            splits = self.text_splitter.split_documents(cleaned_docs)
+            # Split contínuo ao longo do documento inteiro (não por página),
+            # preservando a atribuição de página de cada chunk via mapa de
+            # offsets — ver app.utils.chunking.split_pages_continuous.
+            splits = split_pages_continuous(cleaned_docs, self.text_splitter)
             chunks_before_filter = len(splits)
 
             # Filtrar chunks de baixo valor
             splits = self._filter_chunks(splits)
+
+            # A partir daqui começamos a escrever de verdade (Storage + banco).
+            # Se qualquer etapa falhar, `_cleanup_failed_ingestion` desfaz o
+            # que já tiver sido gravado, para não deixar lixo nem bloquear
+            # uma nova tentativa como falso "already_exists".
+            try:
+                storage_path = await asyncio.to_thread(
+                    self._upload_source_pdf, file_bytes, original_file_id, original_filename
+                )
+            except Exception as exc:
+                logger.error(
+                    "[ingest] falha ao enviar PDF original ao Storage: %s", exc, exc_info=True
+                )
+                return {
+                    "status": "error",
+                    "message": f"Falha ao salvar o PDF original: {exc}",
+                    "original_file_id": original_file_id,
+                    "original_file_name": original_filename,
+                }
 
             # Adicionar metadados normalizados ANTES de salvar.
             # `extraction_method` é gravado para TODOS os caminhos (inclusive o
             # pypdf primário), junto das métricas que justificaram o aceite —
             # sem isso é impossível distinguir depois, olhando só a base, um
             # documento bem extraído de um mal extraído.
+            # `chunk_index` é atribuído DEPOIS do filtro, para ficar sequencial
+            # sem lacunas por arquivo.
             quality_metadata = quality.as_metadata()
-            for split in splits:
+            for idx, split in enumerate(splits):
                 split.metadata['original_file_id'] = original_file_id
                 split.metadata['original_file_name'] = original_file_name
                 split.metadata['extraction_method'] = extraction_method
                 split.metadata['extraction_quality'] = quality_metadata
+                split.metadata['chunk_index'] = idx
 
-            # Adicionar ao vectorstore
-            self.vectorstore.add_documents(splits)
+            try:
+                # `_persist_chunks` faz a chamada de embeddings (rede síncrona,
+                # um lote por `add_documents`) + o backfill — fora do event
+                # loop pelo mesmo motivo da extração: um documento com dezenas
+                # de chunks não pode travar outras requisições (ex.: chat)
+                # enquanto espera a OpenAI responder.
+                await asyncio.to_thread(
+                    self._persist_chunks, splits, original_file_id, original_file_name, storage_path
+                )
+            except Exception:
+                self._cleanup_failed_ingestion(original_file_id, storage_path)
+                raise
 
             return {
                 "status": "success",
@@ -207,6 +284,8 @@ class RAGService:
                 "file_path": file_path,
                 "original_file_id": original_file_id,
                 "original_file_name": original_file_name,
+                "storage_bucket": RAG_SOURCE_PDFS_BUCKET,
+                "storage_path": storage_path,
             }
         except Exception as e:
             return {
@@ -214,6 +293,68 @@ class RAGService:
                 "message": str(e),
                 "file_path": file_path,
             }
+
+    def _persist_chunks(
+        self,
+        splits: List[Document],
+        original_file_id: str,
+        original_file_name: str,
+        storage_path: Optional[str],
+    ) -> None:
+        """Grava os chunks no vectorstore (embeddings + JSONB) e faz o
+        backfill das colunas top-level. Chamado via `asyncio.to_thread` —
+        `add_documents` bate na API de embeddings da OpenAI de forma síncrona."""
+        row_ids = self.vectorstore.add_documents(splits)
+        # Popular também as colunas top-level que vector_admin_repository
+        # já espera ler (page, chunk_index, original_file_id,
+        # original_file_name, storage_bucket, storage_path) — o
+        # SupabaseVectorStore do LangChain só escreve JSONB, então
+        # isso exige um passo próprio.
+        self._backfill_top_level_columns(
+            row_ids, splits, original_file_id, original_file_name, storage_path
+        )
+
+    def _upload_source_pdf(self, file_bytes: bytes, original_file_id: str, original_filename: str) -> str:
+        """Envia o PDF original ao Storage. Nome do objeto é o hash de
+        conteúdo (não o nome original) — evita problemas com espaços/acentos
+        no nome do arquivo e garante unicidade real."""
+        ext = os.path.splitext(original_filename)[1] or ".pdf"
+        storage_path = f"{original_file_id}{ext}"
+        self.supabase_admin.storage.from_(RAG_SOURCE_PDFS_BUCKET).upload(
+            path=storage_path,
+            file=file_bytes,
+            file_options={"content-type": "application/pdf"},
+        )
+        return storage_path
+
+    def _cleanup_failed_ingestion(self, original_file_id: str, storage_path: Optional[str]) -> None:
+        """Remove qualquer rastro de uma ingestão que falhou no meio — chunks
+        já inseridos e o PDF já enviado ao Storage — para que uma nova
+        tentativa não fique bloqueada como `already_exists` nem deixe linhas
+        órfãs na base."""
+        try:
+            resp = (
+                self.supabase_admin.table("documents")
+                .select("id")
+                .filter("metadata->>original_file_id", "eq", original_file_id)
+                .execute()
+            )
+            ids = [row["id"] for row in (resp.data or [])]
+            if ids:
+                self.supabase_admin.table("documents").delete().in_("id", ids).execute()
+                logger.warning(
+                    "[ingest] limpeza pós-falha: %d chunks removidos (original_file_id=%s)",
+                    len(ids), original_file_id,
+                )
+        except Exception as exc:
+            logger.error("[ingest] falha ao limpar chunks após erro: %s", exc, exc_info=True)
+
+        if storage_path:
+            try:
+                self.supabase_admin.storage.from_(RAG_SOURCE_PDFS_BUCKET).remove([storage_path])
+                logger.warning("[ingest] limpeza pós-falha: PDF removido do Storage (%s)", storage_path)
+            except Exception as exc:
+                logger.error("[ingest] falha ao limpar PDF do Storage: %s", exc, exc_info=True)
 
     # NOVO MÉTODO: Verificação de duplicação
     def _check_file_exists(self, original_file_id: str) -> bool:
@@ -244,6 +385,51 @@ class RAGService:
                 e, exc_info=True,
             )
             return False
+
+    def _backfill_top_level_columns(
+        self,
+        row_ids: List[str],
+        splits: List[Document],
+        original_file_id: str,
+        original_file_name: str,
+        storage_path: Optional[str] = None,
+    ) -> None:
+        """Popula page/chunk_index/original_file_id/original_file_name/
+        storage_bucket/storage_path como colunas reais, além do JSONB que o
+        SupabaseVectorStore já grava.
+
+        `add_documents` retorna os IDs inseridos na mesma ordem da lista de
+        entrada (upsert de lote único, RETURNING preserva ordem — mas não é
+        contrato formal da API). Se o tamanho não bater, pula o backfill em
+        vez de arriscar gravar page/chunk_index no chunk errado; o JSONB
+        continua correto de qualquer forma, então nada se perde.
+        """
+        if len(row_ids) != len(splits):
+            logger.error(
+                "[ingest] add_documents retornou %d ids para %d splits — "
+                "pulando backfill de colunas top-level (JSONB continua correto)",
+                len(row_ids), len(splits),
+            )
+            return
+        update_rows = [
+            {
+                "id": row_id,
+                "page": split.metadata.get("page"),
+                "chunk_index": split.metadata.get("chunk_index"),
+                "original_file_id": original_file_id,
+                "original_file_name": original_file_name,
+                "storage_bucket": RAG_SOURCE_PDFS_BUCKET if storage_path else None,
+                "storage_path": storage_path,
+            }
+            for row_id, split in zip(row_ids, splits)
+        ]
+        try:
+            self.supabase_admin.table("documents").upsert(update_rows, on_conflict="id").execute()
+        except Exception as exc:
+            logger.error(
+                "[ingest] falha ao popular colunas top-level: %s — JSONB continua correto",
+                exc, exc_info=True,
+            )
 
     def _accept_extraction(self, docs: List[Document], method: str) -> Optional[ExtractionQuality]:
         """Decide se a extração de um estágio é aceitável.
@@ -497,8 +683,12 @@ class RAGService:
             filtered.append(doc)
         return filtered
 
-    def get_answer(self, question: str, history: Optional[List[List[str]]] = None) -> str:
-        """Ponto de entrada: invoca grafo com pergunta, histórico e tipo detectado."""
+    def get_answer(self, question: str, history: Optional[List[List[str]]] = None) -> AnswerResult:
+        """Ponto de entrada: invoca grafo com pergunta, histórico e tipo detectado.
+
+        Devolve a resposta e as fontes reais (arquivo + páginas) que a
+        embasaram — vazias em caso de recusa, nunca inventadas.
+        """
         lang = self._detect_question_language(question)
         question_type = self._detect_question_type(question)
         logger.info("[get_answer] lang=%s question_type=%s pergunta='%s...'",
@@ -512,6 +702,8 @@ class RAGService:
             "language": lang,
             "history": history or [],
             "question_type": question_type,
+            "insufficient_context": False,
+            "source_docs": [],
         }
         t0 = time.perf_counter()
         result = self.graph.invoke(input_state)
@@ -526,7 +718,42 @@ class RAGService:
             result.get("evaluation", "?"),
             elapsed,
         )
-        return result["answer"]
+        sources = self._build_sources(result.get("source_docs", []))
+        return AnswerResult(answer=result["answer"], sources=sources)
+
+    def _build_sources(self, source_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Agrupa os chunks usados na resposta por arquivo de origem, com o
+        range de páginas coberto. Chunks sem `original_file_name` (não deveria
+        acontecer, mas defensivo) são ignorados — melhor omitir uma fonte do
+        que mostrar uma entrada vazia ou enganosa."""
+        by_file: Dict[str, Dict[str, Any]] = {}
+        for doc in source_docs:
+            file_name = doc.get("original_file_name")
+            if not file_name:
+                continue
+            page_start = doc.get("page_start")
+            page_end = doc.get("page_end")
+            entry = by_file.setdefault(
+                file_name, {"file": file_name, "page_start": page_start, "page_end": page_end}
+            )
+            if page_start is not None and (entry["page_start"] is None or page_start < entry["page_start"]):
+                entry["page_start"] = page_start
+            if page_end is not None and (entry["page_end"] is None or page_end > entry["page_end"]):
+                entry["page_end"] = page_end
+        return list(by_file.values())
+
+    def _extract_source_doc_info(self, docs: List[Document]) -> List[Dict[str, Any]]:
+        """Extrai de cada chunk recuperado só o necessário para citação
+        (arquivo + páginas), leve o bastante para viver no estado do grafo
+        sem carregar os `Document`s inteiros até o retorno final."""
+        return [
+            {
+                "original_file_name": d.metadata.get("original_file_name"),
+                "page_start": d.metadata.get("page_start", d.metadata.get("page")),
+                "page_end": d.metadata.get("page_end", d.metadata.get("page")),
+            }
+            for d in docs
+        ]
 
     def _build_graph(self) -> Any:
         """Grafo com retrieve -> generate -> evaluate -> (conditional retry ou END)."""
@@ -538,17 +765,42 @@ class RAGService:
             Para perguntas conceptuais, adiciona data companions (chunks mais
             ricos em dados do mesmo arquivo) para garantir que tabelas e métricas
             específicas estejam presentes no contexto mesmo sem alta similaridade semântica.
+
+            Perguntas de follow-up são condensadas com o histórico antes da busca —
+            embutir só "E qual a margem por unidade?" sozinho não recupera nada
+            relevante; precisa do turno anterior para virar uma busca autocontida.
             """
-            docs = self._retrieve_docs_via_rpc(state["question"], k=20)
+            retrieval_query = self._condense_followup_question(
+                state["question"], state.get("history", []), state["language"]
+            )
+            docs = self._retrieve_docs_via_rpc(retrieval_query, k=RETRIEVAL_K)
             question_type = state.get("question_type", "conceptual")
             if question_type in ("conceptual", "quantitative"):
                 docs = self._add_data_companion_chunks(docs, max_companions=5)
+            if not docs:
+                logger.warning(
+                    "[retrieve] nenhum chunk atingiu o piso de recusa — sem contexto"
+                )
+                return {"context": "", "insufficient_context": True, "source_docs": []}
             context = "\n\n".join(doc.page_content for doc in docs)
-            return {"context": context}
+            return {
+                "context": context,
+                "insufficient_context": False,
+                "source_docs": self._extract_source_doc_info(docs),
+            }
 
         def generate(state: State) -> Dict[str, str]:
-            """Nó: gera resposta com prompt adaptado ao tipo de pergunta."""
+            """Nó: gera resposta com prompt adaptado ao tipo de pergunta.
+
+            Quando não há contexto suficiente (recusa), devolve a mensagem de
+            recusa direto, sem chamar o LLM — economiza custo e elimina a
+            chance de o modelo "resgatar" um contexto ruim com confiança.
+            """
             lang = state["language"]
+            if state.get("insufficient_context"):
+                logger.info("[generate] contexto insuficiente — recusando sem chamar o LLM")
+                return {"answer": self._build_refusal_message(lang), "evaluation": "REFUSED"}
+
             history = state.get("history", [])
             question_type = state.get("question_type", "conceptual")
 
@@ -587,21 +839,29 @@ class RAGService:
 
         def evaluate(state: State) -> Dict[str, str]:
             """Nó: avalia qualidade da resposta por tipo de pergunta + verificações de conteúdo."""
+            # Recusa já foi decidida em `generate` — não reavaliar como se fosse
+            # uma resposta normal (uma recusa é curta de propósito).
+            if state.get("evaluation") == "REFUSED":
+                return {"evaluation": "REFUSED"}
+
             answer = state["answer"]
             question = state["question"]
             question_type = state.get("question_type", "conceptual")
 
             # ── Verificações universais ────────────────────────────────────────
-            has_content = len(answer.strip()) > 150
+            # Sem piso arbitrário de tamanho (removido — não media qualidade
+            # real, só verbosidade). Resposta vazia continua sendo reprovada,
+            # como rede de segurança mínima.
+            is_empty = not answer.strip()
             is_relevant = self._is_answer_relevant(question, answer)
             too_many_empty = self._count_empty_sections(answer) >= 3
 
-            # Falha imediata se resposta é irrelevante ou quase vazia
-            if too_many_empty or not is_relevant or not has_content:
+            # Falha imediata se resposta é irrelevante ou vazia
+            if too_many_empty or not is_relevant or is_empty:
                 reason = (
                     "muitas seções vazias" if too_many_empty
                     else "sem relevância" if not is_relevant
-                    else "conteúdo insuficiente"
+                    else "resposta vazia"
                 )
                 logger.info(
                     "[evaluate] LOW_QUALITY (%s) type=%s len=%d",
@@ -656,20 +916,24 @@ class RAGService:
             if retry_count == 0:
                 # Retry 1: remove threshold, mantém LLM expansion (já fez no retrieve inicial,
                 # mas aqui é nova chamada sem cache — roda LLM de novo intencionalmente)
-                logger.info("[retrieve_retry] tentativa=1 — removendo threshold, k=30")
+                logger.info("[retrieve_retry] tentativa=1 — removendo threshold, k=%d", RETRIEVAL_K_RETRY)
                 docs = self._retrieve_docs_via_rpc(
-                    question, k=30, skip_threshold=True, use_llm_expansion=True
+                    question, k=RETRIEVAL_K_RETRY, skip_threshold=True, use_llm_expansion=True
                 )
             else:
                 # Retry 2: expansão por regras bilíngues + sem threshold (diferente da LLM)
                 expanded = self._expand_query_for_retry(question)
-                logger.info("[retrieve_retry] tentativa=2 — expansão por regras, k=30")
+                logger.info("[retrieve_retry] tentativa=2 — expansão por regras, k=%d", RETRIEVAL_K_RETRY)
                 docs = self._retrieve_docs_via_rpc(
-                    expanded, k=30, skip_threshold=True, use_llm_expansion=False
+                    expanded, k=RETRIEVAL_K_RETRY, skip_threshold=True, use_llm_expansion=False
                 )
 
             context = "\n\n".join(doc.page_content for doc in docs)
-            return {"context": context, "retry_count": retry_count + 1}
+            return {
+                "context": context,
+                "retry_count": retry_count + 1,
+                "source_docs": self._extract_source_doc_info(docs),
+            }
 
         workflow.add_node("retrieve", retrieve)
         workflow.add_node("generate", generate)
@@ -977,6 +1241,62 @@ class RAGService:
             logger.warning("[expand_query] falha LLM (%s) — usando reescrita local", exc)
         return self._rewrite_query(question, lang)
 
+    def _condense_followup_question(
+        self, question: str, history: List[List[str]], lang: str
+    ) -> str:
+        """Produz uma versão autocontida da pergunta para a busca vetorial.
+
+        Sem isso, uma pergunta de follow-up ("E qual a margem por unidade?")
+        é embutida sozinha, sem o turno anterior — confirmado como causa de
+        recall baixo nas perguntas de follow-up do golden set. Só a QUERY DE
+        BUSCA muda; `state["question"]` original permanece intacto para
+        exibição e para o prompt de geração (que já recebe o histórico completo).
+        """
+        if not history:
+            return question
+        last_pair = history[-1]
+        last_question = last_pair[0] if len(last_pair) >= 1 else ""
+        last_answer = last_pair[1] if len(last_pair) >= 2 else ""
+        try:
+            prompt = (
+                "Reescreva a PERGUNTA DE ACOMPANHAMENTO abaixo como uma pergunta "
+                "completa e autocontida, incorporando o contexto necessário do "
+                "turno anterior. Devolva APENAS a pergunta reescrita, sem "
+                "explicações nem aspas.\n\n"
+                f"Pergunta anterior: {last_question}\n"
+                f"Resposta anterior: {last_answer[:500]}\n"
+                f"Pergunta de acompanhamento: {question}\n\n"
+                "Pergunta reescrita:"
+            )
+            response = self.llm.invoke([HumanMessage(content=prompt)])
+            condensed = response.content.strip().strip('"')
+            if condensed and len(condensed) >= 5:
+                logger.info(
+                    "[condense_followup] '%s' -> '%s'", question, condensed[:80]
+                )
+                return condensed
+            logger.warning("[condense_followup] resposta LLM inválida — usando fallback mecânico")
+        except Exception as exc:
+            logger.warning("[condense_followup] falha LLM (%s) — usando fallback mecânico", exc)
+        return f"{last_question} {question}".strip()
+
+    def _build_refusal_message(self, lang: str) -> str:
+        """Mensagem de recusa honesta quando nenhum chunk atinge o piso mínimo
+        de similaridade — usada no lugar de responder com o melhor match
+        disponível, por mais fraco que seja."""
+        if lang == "pt-BR":
+            return (
+                "Não encontrei informações suficientes na base de documentos "
+                "disponível para responder a essa pergunta com confiança. "
+                "Posso ajudar com outra pergunta relacionada aos temas cobertos "
+                "pela base de conhecimento?"
+            )
+        return (
+            "I couldn't find enough relevant information in the available "
+            "documents to answer this question confidently. Feel free to ask "
+            "something else related to the topics covered in the knowledge base."
+        )
+
     # ── Auxiliares de avaliação de qualidade ──────────────────────────────────
 
     def _is_answer_relevant(self, question: str, answer: str) -> bool:
@@ -1041,21 +1361,25 @@ class RAGService:
         logger.info("[retry] query expandida: %s", expanded)
         return expanded.strip()
 
+    _RERANK_STOPWORDS = {
+        'o', 'a', 'os', 'as', 'um', 'uma', 'de', 'da', 'do', 'dos', 'das',
+        'em', 'no', 'na', 'nos', 'nas', 'para', 'com', 'por', 'que', 'foi',
+        'qual', 'quais', 'como', 'quando', 'onde', 'quanto', 'quantos',
+        'the', 'an', 'of', 'in', 'for', 'is', 'are', 'was', 'what', 'how',
+        'which', 'and', 'or', 'to', 'from', 'this', 'that', 'with',
+    }
+
     def _get_rerank_terms(self, question: str, rewritten_question: str) -> List[str]:
-        """Extrai termos para reranking."""
-        q_lower = question.lower()
-        rw_lower = rewritten_question.lower()
-        terms = set()
-        tilapia_terms = {'tilápia', 'nilo', 'oreochromis', 'niloticus'}
-        if any(t in q_lower or t in rw_lower for t in tilapia_terms):
-            terms.update(tilapia_terms)
-        restriction_terms = {'restrição', 'alimentar', 'dieta', 'restrita', 'feed', 'restriction'}
-        if any(t in q_lower or t in rw_lower for t in restriction_terms):
-            terms.update(restriction_terms)
-        metab_terms = {'metabolismo', 'metabolism'}
-        if any(t in q_lower or t in rw_lower for t in metab_terms):
-            terms.update(metab_terms)
-        return list(terms)
+        """Extrai termos de conteúdo da própria pergunta para o bônus de reranking.
+
+        Generaliza o sinal: antes eram 3 listas fixas de termos hardcoded,
+        específicas dos temas do golden set atual (tilápia/nilo, restrição
+        alimentar, metabolismo) — não generalizavam para perguntas fora
+        desses assuntos exatos. Agora deriva de qualquer pergunta.
+        """
+        combined = f"{question} {rewritten_question}".lower()
+        words = (w.strip('?.,!():;"\'') for w in combined.split())
+        return list({w for w in words if len(w) > 4 and w not in self._RERANK_STOPWORDS})
 
     def _score_doc_bonus(self, doc: Document, terms: List[str]) -> float:
         """Bônus lexical para reranking."""
@@ -1147,7 +1471,7 @@ class RAGService:
     def _retrieve_docs_via_rpc(
         self,
         question: str,
-        k: int = 20,
+        k: int = RETRIEVAL_K,
         skip_threshold: bool = False,
         use_llm_expansion: bool = True,
     ) -> List[Document]:
@@ -1193,12 +1517,27 @@ class RAGService:
                 )
                 deduped = above
             else:
-                logger.warning(
-                    "[retrieve] Nenhum doc acima do threshold %.2f — fallback top-1 (score=%.3f)",
-                    self.similarity_threshold,
-                    deduped[0].metadata.get("similarity", 0) if deduped else 0,
-                )
-                deduped = deduped[:1]
+                best_score = deduped[0].metadata.get("similarity", 0) if deduped else 0
+                if best_score >= REFUSAL_FLOOR_SIMILARITY:
+                    # Zona fraca: nada supera o threshold de confiança alta, mas o
+                    # melhor candidato ainda supera o piso de recusa. Mantém TODOS
+                    # os candidatos (não só o top-1) — restringir a 1 chunk aqui
+                    # sacrificaria recall de perguntas legítimas que caem nessa
+                    # zona só por causa da sobreposição real entre as distribuições
+                    # de similaridade de perguntas respondíveis e fora do escopo
+                    # (ver design.md de retrieval-refusal-quality).
+                    logger.warning(
+                        "[retrieve] Nenhum doc acima do threshold %.2f — zona fraca, "
+                        "mantendo %d candidatos (melhor score=%.3f, acima do piso %.2f)",
+                        self.similarity_threshold, len(deduped), best_score, REFUSAL_FLOOR_SIMILARITY,
+                    )
+                else:
+                    logger.warning(
+                        "[retrieve] Nenhum doc atinge o piso de recusa %.2f "
+                        "(melhor score=%.3f) — recusando",
+                        REFUSAL_FLOOR_SIMILARITY, best_score,
+                    )
+                    deduped = []
 
         return deduped[:k]
 

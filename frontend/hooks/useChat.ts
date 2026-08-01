@@ -2,16 +2,23 @@
 import { useState, useRef } from 'react';
 import api from '@/lib/api';
 
+export interface ChatSource {
+  file: string;
+  page_start: number | null;
+  page_end: number | null;
+}
+
 interface ChatMessage {
   id: string;
   text: string;
   sender: 'user' | 'ai';
   isError?: boolean;
+  sources?: ChatSource[];
 }
 
 interface ChatResponse {
   answer: string;
-  sources: string[];
+  sources: ChatSource[];
 }
 
 export const useChat = () => {
@@ -51,6 +58,7 @@ export const useChat = () => {
         id: (Date.now() + 1).toString(),
         text: response.data.answer,
         sender: 'ai',
+        sources: response.data.sources,
       };
 
       // Adiciona a resposta da IA

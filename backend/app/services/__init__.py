@@ -1,6 +1,6 @@
 """
 Services module for DrTilápia RAG system
-Exports: CleanReindexService, RAGService, VectorAdminService
+Exports: RAGService, VectorAdminService
 """
 
 import logging
@@ -8,7 +8,6 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Explicit imports to resolve IDE references
-from app.services.clean_reindex_service import CleanReindexService
 from app.services.rag_service import RAGService, rag_service
 
 # Vector admin service with graceful error handling
@@ -20,7 +19,6 @@ except Exception as e:
     vector_admin_service = None
 
 __all__ = [
-    'CleanReindexService',
     'RAGService',
     'rag_service',
     'VectorAdminService',

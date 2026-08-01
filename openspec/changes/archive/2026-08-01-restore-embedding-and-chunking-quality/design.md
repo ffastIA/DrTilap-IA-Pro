@@ -63,3 +63,22 @@ Rollback: reverter o código por git e reingerir com a configuração anterior. 
 ## Open Questions
 
 - Chunks menores podem exigir aumentar o `k` de recuperação (hoje 20) para cobrir a mesma extensão de texto. A decisão fica para a mudança de recuperação, que tem a medição para fundamentá-la — mas convém observar o efeito já na verificação desta.
+
+## Resultado da verificação (2026-08-01)
+
+Implementação aplicada e base reingerida de ponta a ponta (4 documentos, dump de segurança antes de qualquer coisa destrutiva). Comparação feita de forma pareada, restrita às mesmas 19 perguntas `in_corpus` que existiam na linha de base (excluindo as 5 perguntas novas sobre o BIP 2024 adicionadas depois da linha de base, para não distorcer a média), e com `llm_expansion=False` dos dois lados — a linha de base tinha sido gravada sem expansão de query, e comparar com expansão ligada de um lado só teria sido uma segunda variável de confusão.
+
+| Config | `mean_recall` (19 perguntas) | `mean_top_similarity` |
+|---|---|---|
+| Linha de base (`ada-002`, chunk 4000/500) | 0.895 | 0.847 |
+| `chunk_size=1200` (proposto originalmente), `k=20` | 0.789 | 0.615 |
+| `chunk_size=1600`, `k=20` | 0.842 | 0.606 |
+| `chunk_size=1200`, `k=40` (teste isolado, só pra confirmar a causa) | **0.895** (idêntico à base) | 0.682 |
+
+**Achado**: nem `chunk_size=1200` nem `1600` recuperam o recall da base mantendo `k=20` fixo. A causa foi isolada experimentalmente: aumentar só o `k` para 40 (sem tocar em chunk_size) faz o recall empatar exatamente com a linha de base. Isso confirma a suspeita já registrada nas "Open Questions" — chunks menores multiplicam o número de chunks por documento (ex.: BIP 2024 foi de 26 chunks com o `chunk_size` antigo para 78 com 1200, 57 com 1600), então a mesma janela `k=20` passa a cobrir uma fração menor do documento.
+
+A queda de `mean_top_similarity` é consistente em praticamente todas as perguntas e provavelmente reflete recalibração de escala entre os dois modelos de embedding (é documentado que `ada-002` produz similaridades de cosseno artificialmente infladas; `text-embedding-3-large` é mais discriminativo mas com números absolutos menores para matches igualmente bons) — não necessariamente pior qualidade de correspondência semântica.
+
+**Decisão final**: aceitar a mudança com `chunk_size=1600` (menor regressão de recall das duas opções testadas), registrando explicitamente que o ganho pretendido só se materializa por completo quando a mudança de recuperação ajustar `k` — decisão consciente do usuário, não uma falha silenciosa. `chunk_overlap` permanece 200. As demais entregas da mudança (config explícita e logada, chunking contínuo com rastreamento de página, colunas `page`/`chunk_index` populadas de fato, TLS corrigido em `clean_reindex_service.py`) foram verificadas e funcionam corretamente, independente do resultado do recall.
+
+Checagem de ponta a ponta (`test_phase6_post_reindex_success_manual.py`): **✅ APROVADO**. Admin (`vector_admin_repository.get_file_chunks`) confirmado exibindo `page`/`chunk_index` reais e sequenciais por arquivo.

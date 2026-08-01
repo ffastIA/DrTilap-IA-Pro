@@ -4,12 +4,13 @@
 # não do comportamento observado do sistema. Cada `expected_passages` é um trecho
 # literal verificado como presente na base.
 #
-# Cobertura: 3 dos 4 documentos indexados.
-#   O `BIP 2024 publicado.pdf` está FORA deste conjunto por falha de extração de
-#   PDF: seus 12 chunks somam ~600 palavras de esqueleto (cabeçalhos de seção,
-#   `p` órfãos de p-values e `Table 1.` sem linhas de dados). Não há o que
-#   recuperar. Perguntas sobre ele devem ser adicionadas quando a extração for
-#   corrigida (change `fix-pdf-extraction-quality`).
+# Cobertura: os 4 documentos indexados.
+#   O `BIP 2024 publicado.pdf` foi reingerido em 2026-08-01 com um exemplar
+#   diferente do original (16 páginas, extração adequada pelo `pypdf` primário,
+#   646,9 palavras/página — ver openspec/changes/archive/.../fix-pdf-extraction-quality).
+#   O exemplar que causou a falha original (12 chunks, ~51 palavras/chunk) não
+#   foi retestado; a questão de saber se o resgate por OCR/Vision recupera
+#   tabelas de um PDF realmente quebrado permanece em aberto nessa mudança.
 #
 # Campos:
 #   id                   identificador estável (não renumerar ao inserir novas)
@@ -26,9 +27,8 @@ corpus_files_covered:
   - "Genetic and phenotypic characterization of Nile tilapia.pdf"
   - "BIA_RAG.pdf"
   - "Indice volumetrico abate.pdf"
-corpus_files_excluded:
-  - file: "BIP 2024 publicado.pdf"
-    reason: "Extração de PDF falhou; chunks contêm apenas esqueleto sem dados."
+  - "BIP 2024 publicado.pdf"
+corpus_files_excluded: []
 
 questions:
 
@@ -104,6 +104,30 @@ questions:
       - "21 meses"
       - "média do setor de 36 a 48 meses"
 
+  - id: bip-rpl-extremos
+    question: "Quais tratamentos apresentaram o maior e o menor nível de proteção relativa (RPL) contra Aeromonas hydrophila no estudo do BIP 2024?"
+    scope: in_corpus
+    question_type: quantitative
+    expected_source_file: "BIP 2024 publicado.pdf"
+    expected_passages:
+      - "Treatments Relative protection level (%)"
+      - "PRO+MOS 64.10"
+    must_mention:
+      - "PRO+MOS com o maior RPL (64,10%)"
+      - "MOS com o menor RPL (21,02%)"
+
+  - id: bip-bacillus-colonizacao
+    question: "Qual foi a contagem de Bacillus (UFC) no intestino dos peixes alimentados com o probiótico PRO, comparada ao grupo controle, no estudo do BIP 2024?"
+    scope: in_corpus
+    question_type: quantitative
+    expected_source_file: "BIP 2024 publicado.pdf"
+    expected_passages:
+      - "PRO 3.5x105 b5.6x106 b"
+      - "Control 1.1x101 a1.9x102 a"
+    must_mention:
+      - "grupo PRO com cerca de 5,6x10⁶ UFC/g no intestino"
+      - "controle com apenas 1,9x10² UFC/g"
+
   # ---------------------------------------------------------------- conceituais
   - id: kv-definicao
     question: "O que é o índice de condição volumétrico (KV) e como ele é calculado?"
@@ -175,6 +199,18 @@ questions:
       - "terceira espécie mais cultivada"
       - "atrás da carpa capim e da carpa prateada"
 
+  - id: bip-mos-crescimento
+    question: "A suplementação com MOS, KAP e o probiótico PAS-TR causou efeito no crescimento ou nas variáveis hematológicas da tilápia no estudo do BIP 2024?"
+    scope: in_corpus
+    question_type: conceptual
+    expected_source_file: "BIP 2024 publicado.pdf"
+    expected_passages:
+      - "did not cause a beneficial or adverse effect on growth"
+      - "these treatments protected the fish from A. hydrophyla infection"
+    must_mention:
+      - "não houve efeito benéfico nem adverso no crescimento ou na hematologia"
+      - "mesmo assim os tratamentos protegeram os peixes contra a infecção por A. hydrophila"
+
   # ---------------------------------------------------------------- metodológicas
   - id: kv-como-medir
     question: "Como o produtor deve coletar as medidas para calcular o KV na fazenda?"
@@ -209,6 +245,18 @@ questions:
     must_mention:
       - "CEUA #01.0696.2022"
       - "classificação FAO: captive propagated, strain-sourced, wild-sourced"
+
+  - id: bip-desafio-protocolo
+    question: "Como foi feito o desafio experimental com Aeromonas hydrophila no estudo do BIP 2024, e como o nível de proteção relativa (RPL) foi calculado?"
+    scope: in_corpus
+    question_type: methodological
+    expected_source_file: "BIP 2024 publicado.pdf"
+    expected_passages:
+      - "the 50% lethal dose (LD) was previously set at 1.26 x 108 CFU"
+      - "RPL (%) = 100"
+    must_mention:
+      - "dose letal (DL50) de 1,26 x 10⁸ UFC/mL"
+      - "RPL calculado comparando a mortalidade do tratamento com a do controle"
 
   # ---------------------------------------------------------------- fora do escopo
   # Plausíveis para o domínio, mas ausentes da base. O sistema DEVE recusar.
@@ -297,3 +345,15 @@ questions:
     must_mention:
       - "mais rendimento de carcaça"
       - "melhor uso da ração"
+
+  - id: fu-bip-rpl-menor
+    question: "E qual teve o menor?"
+    history:
+      - ["Qual tratamento teve o maior nível de proteção relativa (RPL) contra Aeromonas hydrophila no estudo do BIP 2024?", "O tratamento PRO+MOS apresentou o maior RPL, com 64,10%."]
+    scope: in_corpus
+    question_type: quantitative
+    expected_source_file: "BIP 2024 publicado.pdf"
+    expected_passages:
+      - "MOS 21.02"
+    must_mention:
+      - "MOS com 21,02%"

@@ -46,17 +46,6 @@ class VectorAdminService:
                 return method(*args, **kwargs)
         raise NotImplementedError(f"No compatible method found in repository for: {method_names}")
 
-    async def _call_repo_method_async(self, method_names: List[str], *args, **kwargs) -> Any:
-        self._ensure_repository()
-        for name in method_names:
-            if hasattr(self.repository, name):
-                method = getattr(self.repository, name)
-                result = method(*args, **kwargs)
-                if hasattr(result, '__await__'):
-                    return await result
-                return result
-        raise NotImplementedError(f"No compatible method found in repository for: {method_names}")
-
     def get_files(self) -> Any:
         return self._call_repo_method(['get_files', 'list_files', 'list_vector_files', 'fetch_files'])
 
@@ -72,11 +61,6 @@ class VectorAdminService:
 
     def get_file_diagnosis(self, original_file_id: str) -> Any:
         return self._call_repo_method(['get_file_diagnosis', 'diagnose_file', 'get_diagnosis'], original_file_id)
-
-    async def reindex_files(self, file_ids: Optional[List[str]] = None) -> Any:
-        if file_ids is None:
-            file_ids = []
-        return await self._call_repo_method_async(['reindex_files', 'reindex_file_ids', 'reindex'], file_ids)
 
     def delete_file(self, original_file_id: str, confirmation_phrase: Union[str, bool] = True,
                     reason: Optional[str] = None, hard_delete: bool = True) -> Any:

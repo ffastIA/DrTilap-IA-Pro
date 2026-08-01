@@ -202,19 +202,21 @@ def test_login_invalid_credentials(client, monkeypatch):
 
 
 def test_chat_success(client, monkeypatch):
-    """Testa chat bem-sucedido."""
-    async def mock_get_answer(message, history):
-        return {"response": "Resposta mockada", "sources": []}
+    """Testa chat bem-sucedido, incluindo as fontes reais na resposta."""
+    from app.services.rag_service import AnswerResult
+
+    def mock_get_answer(message, history):
+        return AnswerResult(
+            answer="Resposta mockada",
+            sources=[{"file": "doc.pdf", "page_start": 0, "page_end": 1}],
+        )
     monkeypatch.setattr(main_module.rag_service, "get_answer", mock_get_answer)
     payload = {"message": "Olá", "history": []}
     response = client.post("/consultoria/chat", json=payload)
     assert response.status_code == 200
     data = response.json()
-    # Aceitar tanto diretamente quanto embrulhado em "answer"
-    if "answer" in data:
-        data = data["answer"]
-    assert "response" in data
-    assert "sources" in data
+    assert data["answer"] == "Resposta mockada"
+    assert data["sources"] == [{"file": "doc.pdf", "page_start": 0, "page_end": 1}]
 
 
 def test_chat_internal_error(monkeypatch):
