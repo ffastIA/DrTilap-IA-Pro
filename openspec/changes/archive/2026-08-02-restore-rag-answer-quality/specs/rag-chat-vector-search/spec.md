@@ -1,14 +1,4 @@
-# rag-chat-vector-search Specification
-
-## Purpose
-TBD - defined by change fix-chat-rpc-and-backfill-file-ids. Update Purpose after archiving.
-## Requirements
-### Requirement: Chat endpoint uses the vector search function that actually exists
-`POST /consultoria/chat` SHALL retrieve relevant document chunks by calling the `rpc_vector_search` Postgres function (with its actual parameter names), not a nonexistent `match_documents` function.
-
-#### Scenario: Chat request succeeds
-- **WHEN** an authenticated user calls `POST /consultoria/chat` with a question
-- **THEN** the backend does not raise a 500 error caused by a missing RPC function, and returns a 200 response with an answer
+## MODIFIED Requirements
 
 ### Requirement: Similarity threshold filtering happens after retrieval
 Since `rpc_vector_search` does not accept a similarity-threshold parameter, the backend SHALL request enough candidate matches from the function and then select the answer context by rank, not by a single confidence threshold applied as an all-or-nothing gate. The selected context SHALL always fall between a configured minimum and maximum chunk count (unless the question is refused), bounded by a total character budget, so that context size never collapses to a handful of chunks nor grows to consume most of the retrieved candidate pool. The refusal floor below which the system declines to answer SHALL remain a separate, lower-priority check than the ranking window.
@@ -44,31 +34,7 @@ When building sources for the chat answer, the backend SHALL resolve each chunk'
 - **WHEN** a chunk was added to the context through a supplementary mechanism unrelated to the question's semantic match (rather than through ranked retrieval)
 - **THEN** that chunk's source document is not added to the citation list unless a chunk from the same document was already included through ranked retrieval
 
-### Requirement: The system refuses honestly when it has no relevant information
-When no retrieved chunk reaches a minimum confidence floor, the system SHALL decline to answer rather than generating a response from the best available (but insufficiently similar) match.
-
-#### Scenario: Out-of-corpus question is refused
-- **WHEN** a user asks a question whose best-matching chunk falls below the configured refusal floor
-- **THEN** the response is an honest refusal, not a confidently-worded answer built from weak or unrelated context
-
-#### Scenario: Refusal does not invoke the answer-generation model
-- **WHEN** the system determines that no chunk meets the refusal floor
-- **THEN** it returns the refusal response without an additional call to the language model
-
-#### Scenario: Answerable questions are not refused
-- **WHEN** a user asks a question that the indexed documents can answer
-- **THEN** the system does not refuse, and proceeds to retrieve and generate normally
-
-### Requirement: Conversation history informs retrieval, not only generation
-When a chat request includes prior conversation turns, the system SHALL use that history to produce a self-contained retrieval query, so that a follow-up question that is only interpretable given prior turns still retrieves relevant content.
-
-#### Scenario: Follow-up question retrieves using prior context
-- **WHEN** a follow-up question omits its subject (e.g. "e para alevinos?") but prior turns establish that subject
-- **THEN** the retrieval query used to search the vector store incorporates that prior context, not just the literal follow-up text
-
-#### Scenario: A question with no history is retrieved unchanged
-- **WHEN** a chat request has no prior turns
-- **THEN** the retrieval query is the user's question as given, with no condensation step altering it
+## ADDED Requirements
 
 ### Requirement: Answers are composed as continuous prose
 The system SHALL generate answers as continuous prose organized in paragraphs, not as a fixed set of mandatory labeled sections. Bulleted or numbered lists SHALL be used only where they aid readability for genuine enumerations, never as a required structural template applied regardless of content.
@@ -102,4 +68,3 @@ When the best-matching retrieved content falls short of high confidence but stil
 #### Scenario: A high-confidence answer is not caveated unnecessarily
 - **WHEN** the system answers a question whose best-matching content is at or above the high-confidence threshold
 - **THEN** the answer does not include a confidence caveat
-

@@ -147,8 +147,9 @@ def tracked_retrieve(question, k=5, **kwargs):
 
 rag_service._retrieve_docs_via_rpc = tracked_retrieve
 
-# Patch LLM invoke (nível da classe)
-llm_class = type(rag_service.llm)
+# Patch LLM invoke (nível da classe) — llm_generation/llm_utility são a
+# mesma classe (ChatOpenAI), então isso intercepta as duas instâncias.
+llm_class = type(rag_service.llm_generation)
 original_llm_invoke = llm_class.invoke
 
 

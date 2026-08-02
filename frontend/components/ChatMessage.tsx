@@ -8,15 +8,35 @@ interface ChatMessageProps {
   sources?: ChatSource[];
 }
 
+// Colapsa páginas discretas contíguas em intervalos só para leitura — o
+// backend envia a lista exata (0-indexed), a apresentação decide como
+// agrupar visualmente. Ex.: [2, 3, 4, 8] -> "3-5, 9" (convertido para 1-indexed).
+function formatPageRanges(pages: number[]): string {
+  if (pages.length === 0) return '';
+  const sorted = [...pages].sort((a, b) => a - b);
+  const ranges: string[] = [];
+  let start = sorted[0];
+  let prev = sorted[0];
+  for (let i = 1; i <= sorted.length; i += 1) {
+    const current = sorted[i];
+    if (current === prev + 1) {
+      prev = current;
+      continue;
+    }
+    ranges.push(start === prev ? `${start + 1}` : `${start + 1}-${prev + 1}`);
+    if (current !== undefined) {
+      start = current;
+      prev = current;
+    }
+  }
+  return ranges.join(', ');
+}
+
 function formatSource(source: ChatSource): string {
-  if (source.page_start == null) {
+  if (!source.pages || source.pages.length === 0) {
     return source.file;
   }
-  const pages =
-    source.page_end != null && source.page_end !== source.page_start
-      ? `p. ${source.page_start + 1}-${source.page_end + 1}`
-      : `p. ${source.page_start + 1}`;
-  return `${source.file} (${pages})`;
+  return `${source.file} (p. ${formatPageRanges(source.pages)})`;
 }
 
 const ChatMessage: React.FC<ChatMessageProps> = ({ message, isUser, sources }) => {

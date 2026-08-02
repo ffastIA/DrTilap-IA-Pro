@@ -5,6 +5,7 @@ import json
 import hashlib
 import logging
 import asyncio
+import unicodedata
 import httpx
 from typing import TypedDict, Dict, Any, List, Literal, Optional, Tuple, NamedTuple
 
@@ -44,10 +45,16 @@ from app.database import supabase_admin, _resolve_ssl_verify
 from app.utils.pdf_cleaning import clean_loaded_pages, is_editorial_or_low_value, contains_scientific_signal
 from app.utils.extraction_quality import assess_extraction, ExtractionQuality
 from app.utils.chunking import split_pages_continuous
+from app.utils.answer_quality import looks_like_empty_skeleton, find_unsupported_numbers
 from app.utils.rag_config import (
     EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, CHUNK_SIZE, CHUNK_OVERLAP,
     RETRIEVAL_K, RETRIEVAL_K_RETRY, REFUSAL_FLOOR_SIMILARITY,
     PRIMARY_RPC_SIMILARITY_THRESHOLD,
+    CONTEXT_MIN_CHUNKS, CONTEXT_MAX_CHUNKS, CONTEXT_CHAR_BUDGET,
+    CONTEXT_RELATIVE_MARGIN, CONTEXT_ABSOLUTE_FLOOR, CITATION_MAX_FILES,
+    GENERATION_MODEL, UTILITY_MODEL,
+    DATA_COMPANION_ENABLED, DATA_COMPANION_MAX_TOTAL,
+    HYBRID_SEARCH_ENABLED, RRF_K, LEXICAL_DISCRIMINATIVE_MAX_DOC_FREQ,
 )
 
 
@@ -75,12 +82,18 @@ class State(TypedDict):
     context: str
     answer: str
     evaluation: str
-    retry_count: int
     language: str
     history: List[List[str]]   # pares [pergunta_humano, resposta_ai]
     question_type: str         # quantitative | conceptual | comparative | methodological
     insufficient_context: bool  # True quando nenhum chunk atinge o piso de recusa
     source_docs: List[Dict[str, Any]]  # metadata leve dos chunks usados, para citação
+    context_confidence: str    # strong | partial — ver `_select_context_docs`/design.md
+    effective_type: str        # question_type efetivo usado na geração (pode divergir do original)
+    unsupported_numbers: List[str]  # números da resposta ausentes do contexto — ver `verify_numeric`
+    numeric_regen_count: int   # tentativas de regeneração por `verify_numeric` (máx. 1)
+    context_sufficiency: str   # sufficient | partial | insufficient — ver `grade_context`
+    retrieval_query: str       # pergunta condensada (follow-up + histórico), usada na busca
+    reformulation_count: int   # tentativas de reformulação de query (máx. 1) — ver `reformulate_and_retrieve`
 
 
 class AnswerResult(NamedTuple):
@@ -90,6 +103,13 @@ class AnswerResult(NamedTuple):
     """
     answer: str
     sources: List[Dict[str, Any]]
+    # Campos internos para consumo do harness de avaliação (ex.: `context`, o
+    # texto exato enviado à chamada de geração) — não é contrato de API
+    # pública, produção (`main.py`) não deve depender deste campo. `None` em
+    # vez de `{}` como default: um dict mutável compartilhado entre todas as
+    # instâncias que não passam `debug=` seria um risco real de mutação
+    # cruzada entre chamadas.
+    debug: Optional[Dict[str, Any]] = None
 
 
 class RAGService:
@@ -112,8 +132,20 @@ class RAGService:
             http_client=_http_client,
             http_async_client=_http_async_client,
         )
-        self.llm = ChatOpenAI(
-            model="gpt-4o-mini",
+        # Modelo de geração final (só o nó `generate`) separado do modelo
+        # utilitário (expansão de query, condensação de follow-up, Vision
+        # OCR) — a chamada de geração é o gargalo de qualidade mais isolável
+        # para Q&A científico com números/tabelas; ver design.md de
+        # restore-rag-answer-quality.
+        self.llm_generation = ChatOpenAI(
+            model=GENERATION_MODEL,
+            temperature=0,
+            openai_api_key=openai_api_key,
+            http_client=_http_client,
+            http_async_client=_http_async_client,
+        )
+        self.llm_utility = ChatOpenAI(
+            model=UTILITY_MODEL,
             temperature=0,
             openai_api_key=openai_api_key,
             http_client=_http_client,
@@ -136,10 +168,12 @@ class RAGService:
         logger.info(
             "[RAGService] embedding_model=%s embedding_dimensions=%s "
             "chunk_size=%s chunk_overlap=%s similarity_threshold=%.2f "
-            "retrieval_k=%s retrieval_k_retry=%s refusal_floor_similarity=%.2f",
+            "retrieval_k=%s retrieval_k_retry=%s refusal_floor_similarity=%.2f "
+            "generation_model=%s utility_model=%s",
             EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, CHUNK_SIZE, CHUNK_OVERLAP,
             self.similarity_threshold,
             RETRIEVAL_K, RETRIEVAL_K_RETRY, REFUSAL_FLOOR_SIMILARITY,
+            GENERATION_MODEL, UTILITY_MODEL,
         )
         self.graph = self._build_graph()
 
@@ -640,7 +674,7 @@ class RAGService:
                 ])
                 # Timeout por página: sem ele, uma chamada travada bloqueia a
                 # ingestão inteira indefinidamente.
-                resp = self.llm.invoke([message], timeout=OCR_PAGE_TIMEOUT_SECONDS)
+                resp = self.llm_utility.invoke([message], timeout=OCR_PAGE_TIMEOUT_SECONDS)
                 extracted = resp.content.strip()
                 if extracted:
                     docs.append(Document(
@@ -698,59 +732,97 @@ class RAGService:
             "context": "",
             "answer": "",
             "evaluation": "",
-            "retry_count": 0,
             "language": lang,
             "history": history or [],
             "question_type": question_type,
             "insufficient_context": False,
             "source_docs": [],
+            "context_confidence": "strong",
+            "effective_type": question_type,
+            "unsupported_numbers": [],
+            "numeric_regen_count": 0,
+            "context_sufficiency": "",
+            "retrieval_query": "",
+            "reformulation_count": 0,
         }
         t0 = time.perf_counter()
         result = self.graph.invoke(input_state)
         elapsed = time.perf_counter() - t0
 
         logger.info(
-            "[metrics] type=%-14s lang=%-5s retries=%d answer_len=%4d eval=%-12s time=%.2fs",
+            "[metrics] type=%-14s lang=%-5s reformulations=%d sufficiency=%-12s answer_len=%4d eval=%-12s time=%.2fs",
             question_type,
             lang,
-            result.get("retry_count", 0),
+            result.get("reformulation_count", 0),
+            result.get("context_sufficiency", "?"),
             len(result.get("answer", "")),
             result.get("evaluation", "?"),
             elapsed,
         )
         sources = self._build_sources(result.get("source_docs", []))
-        return AnswerResult(answer=result["answer"], sources=sources)
+        debug = {"context": result.get("context", "")}
+        return AnswerResult(answer=result["answer"], sources=sources, debug=debug)
 
     def _build_sources(self, source_docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Agrupa os chunks usados na resposta por arquivo de origem, com o
-        range de páginas coberto. Chunks sem `original_file_name` (não deveria
-        acontecer, mas defensivo) são ignorados — melhor omitir uma fonte do
-        que mostrar uma entrada vazia ou enganosa."""
-        by_file: Dict[str, Dict[str, Any]] = {}
+        """Agrupa os chunks usados na resposta por arquivo de origem, com a
+        lista de páginas DISCRETAS realmente presentes nos chunks do
+        contexto final — não mais um span min/max sobre tudo que foi
+        recuperado (produzia citações como "página 0 a 15" para uma
+        resposta que na verdade usou 2 chunks específicos, uma vez que a
+        seleção incluía companions e/ou dezenas de candidatos da zona
+        fraca). Chunks sem `original_file_name` são ignorados — melhor
+        omitir uma fonte do que mostrar uma entrada vazia ou enganosa.
+
+        Chunks de companion (`doc["companion"]`) NÃO introduzem um arquivo
+        novo sozinhos: um chunk trazido só por densidade de dígitos nunca
+        justificou, sozinho, citar um documento que a busca semântica não
+        recuperou — só contam se o arquivo já foi citado por um chunk de
+        ranking genuíno.
+
+        Arquivos ordenados pela primeira aparição em `source_docs` (que
+        preserva a ordem de rank — companions são sempre appendados no
+        final da lista de docs, então nunca vêm antes do chunk genuíno que
+        os torna elegíveis), limitado a `CITATION_MAX_FILES`.
+        """
+        pages_by_file: Dict[str, set] = {}
+        order: List[str] = []
+        has_genuine_chunk: Dict[str, bool] = {}
+
         for doc in source_docs:
             file_name = doc.get("original_file_name")
             if not file_name:
                 continue
+            if file_name not in pages_by_file:
+                pages_by_file[file_name] = set()
+                order.append(file_name)
+                has_genuine_chunk[file_name] = False
+            if not doc.get("companion", False):
+                has_genuine_chunk[file_name] = True
+
             page_start = doc.get("page_start")
             page_end = doc.get("page_end")
-            entry = by_file.setdefault(
-                file_name, {"file": file_name, "page_start": page_start, "page_end": page_end}
-            )
-            if page_start is not None and (entry["page_start"] is None or page_start < entry["page_start"]):
-                entry["page_start"] = page_start
-            if page_end is not None and (entry["page_end"] is None or page_end > entry["page_end"]):
-                entry["page_end"] = page_end
-        return list(by_file.values())
+            if page_start is not None and page_end is not None:
+                pages_by_file[file_name].update(range(page_start, page_end + 1))
+            elif page_start is not None:
+                pages_by_file[file_name].add(page_start)
+
+        results = [
+            {"file": file_name, "pages": sorted(pages_by_file[file_name])}
+            for file_name in order
+            if has_genuine_chunk[file_name]
+        ]
+        return results[:CITATION_MAX_FILES]
 
     def _extract_source_doc_info(self, docs: List[Document]) -> List[Dict[str, Any]]:
         """Extrai de cada chunk recuperado só o necessário para citação
-        (arquivo + páginas), leve o bastante para viver no estado do grafo
-        sem carregar os `Document`s inteiros até o retorno final."""
+        (arquivo + páginas + se é companion), leve o bastante para viver no
+        estado do grafo sem carregar os `Document`s inteiros até o retorno final."""
         return [
             {
                 "original_file_name": d.metadata.get("original_file_name"),
                 "page_start": d.metadata.get("page_start", d.metadata.get("page")),
                 "page_end": d.metadata.get("page_end", d.metadata.get("page")),
+                "companion": bool(d.metadata.get("companion", False)),
             }
             for d in docs
         ]
@@ -773,72 +845,211 @@ class RAGService:
             retrieval_query = self._condense_followup_question(
                 state["question"], state.get("history", []), state["language"]
             )
-            docs = self._retrieve_docs_via_rpc(retrieval_query, k=RETRIEVAL_K)
+            trace: Dict[str, Any] = {}
+            docs = self._retrieve_docs_via_rpc(retrieval_query, k=RETRIEVAL_K, trace_out=trace)
+            # Confiança derivada da similaridade ANTES de companions/preenchimento
+            # mínimo — o que importa é se o match semântico original foi forte,
+            # não se a seleção foi completada por outro mecanismo.
+            top_similarity = trace.get("top_similarity_raw", 0.0)
+            context_confidence = "strong" if top_similarity >= self.similarity_threshold else "partial"
             question_type = state.get("question_type", "conceptual")
             if question_type in ("conceptual", "quantitative"):
-                docs = self._add_data_companion_chunks(docs, max_companions=5)
+                docs = self._add_data_companion_chunks(docs)
             if not docs:
                 logger.warning(
                     "[retrieve] nenhum chunk atingiu o piso de recusa — sem contexto"
                 )
-                return {"context": "", "insufficient_context": True, "source_docs": []}
+                return {
+                    "context": "", "insufficient_context": True, "source_docs": [],
+                    "context_confidence": context_confidence, "retrieval_query": retrieval_query,
+                }
             context = "\n\n".join(doc.page_content for doc in docs)
             return {
                 "context": context,
                 "insufficient_context": False,
                 "source_docs": self._extract_source_doc_info(docs),
+                "context_confidence": context_confidence,
+                "retrieval_query": retrieval_query,
             }
 
-        def generate(state: State) -> Dict[str, str]:
-            """Nó: gera resposta com prompt adaptado ao tipo de pergunta.
+        def grade_context(state: State) -> Dict[str, Any]:
+            """Nó (MODO OBSERVAÇÃO — grupo 2 de `add-rag-self-correction-loop`):
+            julga se o contexto recuperado é suficiente para responder à
+            pergunta, ANTES de gastar uma chamada de geração nele.
+
+            Ainda não altera o fluxo do grafo — o resultado é só logado e
+            gravado no State para calibração contra o golden set adversarial
+            (task 3). A reformulação condicionada a `insufficient`
+            (substituindo `retrieve_retry`) é a task 4.
+
+            Usa `retrieval_query` (condensada com histórico por `retrieve`),
+            não `state["question"]` cru — bug encontrado na calibração
+            inicial: as 4 perguntas de follow-up do golden set (ex.: "E qual
+            teve o menor?") eram julgadas `insufficient` mesmo com o contexto
+            correto, porque a pergunta crua é ininteligível sem o turno
+            anterior. `generate` não tem esse problema porque recebe o
+            histórico completo como mensagens; `grade_context` não carrega
+            histórico (mais barato), então precisa da versão já
+            autocontida.
+            """
+            if state.get("insufficient_context"):
+                # Já não há contexto algum (piso de recusa por similaridade) —
+                # nada para julgar semanticamente, e `generate` já vai recusar.
+                return {"context_sufficiency": "insufficient"}
+
+            question_for_grading = state.get("retrieval_query") or state["question"]
+            sufficiency = self._grade_context_verdict(question_for_grading, state["context"])
+            logger.info(
+                "[grade_context] sufficiency=%s (modo observação, não altera o fluxo)",
+                sufficiency,
+            )
+            return {"context_sufficiency": sufficiency}
+
+        def generate(state: State) -> Dict[str, Any]:
+            """Nó: gera resposta em prosa contínua, com ênfase adaptada ao
+            tipo de pergunta e ressalva explícita quando a confiança da
+            recuperação é parcial.
 
             Quando não há contexto suficiente (recusa), devolve a mensagem de
             recusa direto, sem chamar o LLM — economiza custo e elimina a
-            chance de o modelo "resgatar" um contexto ruim com confiança.
+            chance de o modelo "resgatar" um contexto ruim com confiança. Se
+            o contexto existe mas o modelo mesmo assim conclui que não pode
+            responder, ele sinaliza isso com `NO_ANSWER_SENTINEL`, detectado
+            abaixo e convertido na mesma mensagem de recusa.
             """
             lang = state["language"]
             if state.get("insufficient_context"):
                 logger.info("[generate] contexto insuficiente — recusando sem chamar o LLM")
-                return {"answer": self._build_refusal_message(lang), "evaluation": "REFUSED"}
+                return {
+                    "answer": self._build_refusal_message(lang),
+                    "evaluation": "REFUSED",
+                    "source_docs": [],
+                }
 
             history = state.get("history", [])
             question_type = state.get("question_type", "conceptual")
 
             # Se o tipo é quantitativo mas o contexto é pobre/garbled,
-            # usa template conceptual para evitar resposta toda vazia
+            # usa ênfase conceptual para evitar resposta toda vazia.
             effective_type = question_type
             if question_type == "quantitative" and self._is_context_poor(state.get("context", "")):
                 effective_type = "conceptual"
                 logger.info("[generate] contexto pobre — degradando quantitative→conceptual")
 
-            lang_instruction = (
-                "Responda COMPLETAMENTE em português (pt-BR)."
-                if lang == "pt-BR"
-                else "Respond COMPLETELY in English."
+            answer = self._generate_answer_text(
+                question=state["question"],
+                context=state["context"],
+                language=lang,
+                effective_type=effective_type,
+                context_confidence=state.get("context_confidence", "strong"),
+                history=history,
             )
 
-            system_content = self._build_system_prompt(effective_type, lang_instruction)
+            # Substring, não igualdade exata: apesar da instrução pedir
+            # "exatamente X e nada mais", o modelo às vezes escreve uma
+            # explicação primeiro e só então acrescenta o sentinela no
+            # final — observado ao vivo (`oos-dieta-restritiva`: resposta
+            # em prosa explicando a ausência de dados, sentinela ao fim).
+            # Igualdade exata deixava esse caso passar como resposta válida,
+            # citando fontes que não sustentavam nada — exatamente o
+            # sintoma que esta change existe para eliminar.
+            if self.NO_ANSWER_SENTINEL in answer:
+                logger.info(
+                    "[generate] modelo sinalizou que não pode responder com o contexto disponível"
+                )
+                return {
+                    "answer": self._build_refusal_message(lang),
+                    "evaluation": "REFUSED",
+                    "source_docs": [],
+                }
 
-            # Montar lista de mensagens: system + histórico + pergunta atual com contexto
-            messages = [SystemMessage(content=system_content)]
+            return {"answer": answer, "effective_type": effective_type}
 
-            for pair in history:
-                if len(pair) >= 1 and pair[0]:
-                    messages.append(HumanMessage(content=pair[0]))
-                if len(pair) >= 2 and pair[1]:
-                    messages.append(AIMessage(content=pair[1]))
+        def verify_numeric(state: State) -> Dict[str, Any]:
+            """Nó: confere que todo número citado na resposta aparece no
+            contexto — sinal determinístico e de custo zero (regex, sem
+            LLM) contra o pior modo de falha num corpus inteiro
+            quantitativo: um valor inventado com aparência de dado real.
 
-            current_message = (
-                f"**CONTEXT:**\n{state['context']}\n\n"
-                f"**QUESTION:** {state['question']}"
+            Roda depois de `generate`, antes de `evaluate`. Recusa não tem
+            números para verificar. No máximo 1 regeneração, com instrução
+            de correção citando os valores específicos não suportados —
+            uma segunda falha é aceita sem 3ª tentativa (pode ser
+            aritmética legitimamente derivada do contexto, não uma
+            invenção — ver risco aceito em design.md).
+            """
+            if state.get("evaluation") == "REFUSED":
+                return {"unsupported_numbers": []}
+
+            context = state.get("context", "")
+            unsupported = find_unsupported_numbers(state["answer"], context)
+
+            if not unsupported:
+                return {"unsupported_numbers": []}
+
+            if state.get("numeric_regen_count", 0) >= 1:
+                logger.warning(
+                    "[verify_numeric] resposta regenerada ainda cita números fora do "
+                    "contexto: %s — aceitando (sem 3ª tentativa)",
+                    unsupported,
+                )
+                return {"unsupported_numbers": unsupported}
+
+            logger.info(
+                "[verify_numeric] números fora do contexto: %s — regenerando com correção",
+                unsupported,
             )
-            messages.append(HumanMessage(content=current_message))
+            lang = state["language"]
+            correction_instruction = (
+                "CORRECTION REQUIRED: your previous answer cited the following numeric "
+                "value(s), which do NOT appear anywhere in the provided context: "
+                f"{', '.join(unsupported)}. Remove or correct each of them — state only "
+                "numbers that are explicitly present in the context above."
+            )
+            regenerated = self._generate_answer_text(
+                question=state["question"],
+                context=context,
+                language=lang,
+                effective_type=state.get("effective_type", state.get("question_type", "conceptual")),
+                context_confidence=state.get("context_confidence", "strong"),
+                history=state.get("history", []),
+                correction_instruction=correction_instruction,
+            )
+            next_regen_count = state.get("numeric_regen_count", 0) + 1
 
-            response = self.llm.invoke(messages)
-            return {"answer": response.content}
+            if self.NO_ANSWER_SENTINEL in regenerated:
+                logger.info("[verify_numeric] regeneração resultou em sentinela — recusando")
+                return {
+                    "answer": self._build_refusal_message(lang),
+                    "evaluation": "REFUSED",
+                    "source_docs": [],
+                    "unsupported_numbers": [],
+                    "numeric_regen_count": next_regen_count,
+                }
+
+            still_unsupported = find_unsupported_numbers(regenerated, context)
+            return {
+                "answer": regenerated,
+                "unsupported_numbers": still_unsupported,
+                "numeric_regen_count": next_regen_count,
+            }
 
         def evaluate(state: State) -> Dict[str, str]:
-            """Nó: avalia qualidade da resposta por tipo de pergunta + verificações de conteúdo."""
+            """Nó: avalia qualidade da resposta — não vazia, relevante à
+            pergunta, e não um esqueleto de "sem dados" disfarçado de
+            resposta.
+
+            Não depende mais de cabeçalho de seção por tipo de pergunta —
+            o formato de resposta é prosa contínua (ver
+            `_build_system_prompt`), então checagens como `"COMPARISON:" in
+            answer` não têm mais objeto e reprovariam toda resposta válida.
+            Essa remoção elimina de quebra o descasamento entre
+            `question_type` e o tipo efetivamente usado na geração
+            (`effective_type`, quando `generate` degrada quantitative→
+            conceptual por contexto pobre): antes o `evaluate` continuava
+            cobrando cabeçalhos do tipo original mesmo quando `generate`
+            usava outro, gerando 2 retries garantidamente inúteis.
+            """
             # Recusa já foi decidida em `generate` — não reavaliar como se fosse
             # uma resposta normal (uma recusa é curta de propósito).
             if state.get("evaluation") == "REFUSED":
@@ -846,112 +1057,198 @@ class RAGService:
 
             answer = state["answer"]
             question = state["question"]
-            question_type = state.get("question_type", "conceptual")
 
-            # ── Verificações universais ────────────────────────────────────────
-            # Sem piso arbitrário de tamanho (removido — não media qualidade
-            # real, só verbosidade). Resposta vazia continua sendo reprovada,
-            # como rede de segurança mínima.
             is_empty = not answer.strip()
             is_relevant = self._is_answer_relevant(question, answer)
-            too_many_empty = self._count_empty_sections(answer) >= 3
+            is_skeleton = looks_like_empty_skeleton(answer)
 
-            # Falha imediata se resposta é irrelevante ou vazia
-            if too_many_empty or not is_relevant or is_empty:
+            if is_empty or not is_relevant or is_skeleton:
                 reason = (
-                    "muitas seções vazias" if too_many_empty
+                    "resposta vazia" if is_empty
                     else "sem relevância" if not is_relevant
-                    else "resposta vazia"
+                    else "esqueleto sem conteúdo real"
                 )
-                logger.info(
-                    "[evaluate] LOW_QUALITY (%s) type=%s len=%d",
-                    reason, question_type, len(answer),
-                )
+                logger.info("[evaluate] LOW_QUALITY (%s) len=%d", reason, len(answer))
                 return {"evaluation": "LOW_QUALITY"}
 
-            # ── Verificações por tipo ──────────────────────────────────────────
-            if question_type == "conceptual":
-                quality = "HIGH_QUALITY"
+            logger.info("[evaluate] HIGH_QUALITY len=%d", len(answer))
+            return {"evaluation": "HIGH_QUALITY"}
 
-            elif question_type == "comparative":
-                has_comparison = "COMPARISON:" in answer
-                has_differences = "KEY DIFFERENCES:" in answer or "DIFFERENCES:" in answer
-                quality = "HIGH_QUALITY" if (has_comparison and has_differences) else "LOW_QUALITY"
+        def route_after_grade_context(state: State) -> Literal["reformulate", "generate", "give_up"]:
+            """Condicional: só `insufficient` desvia do caminho direto para
+            `generate` — `sufficient`/`partial` vão direto (`partial` já
+            carrega a ressalva via `context_confidence`, tratada em
+            `generate`). No máximo 1 reformulação: uma 2ª tentativa também
+            `insufficient` desiste, não tenta uma 3ª vez (design.md, decisão
+            3 — dados do programa mostram que mais tentativas não melhoram
+            o resultado)."""
+            if state["context_sufficiency"] != "insufficient":
+                return "generate"
+            if state.get("reformulation_count", 0) < 1:
+                return "reformulate"
+            return "give_up"
 
-            elif question_type == "methodological":
-                has_design = "EXPERIMENTAL DESIGN:" in answer or "DESIGN:" in answer
-                has_procedures = "PROCEDURES:" in answer or "PROCEDURE:" in answer
-                quality = "HIGH_QUALITY" if (has_design and has_procedures) else "LOW_QUALITY"
-
-            else:  # quantitative
-                has_real_data = self._data_section_has_numbers(answer)
-                sections_ok = sum(
-                    1 for s in ["DATA:", "METHODOLOGY:", "INTERPRETATION:"]
-                    if s in answer and "Empty section" not in answer.split(s)[1].split("\n")[0]
-                )
-                quality = "HIGH_QUALITY" if (has_real_data and sections_ok >= 2) else "LOW_QUALITY"
-
-            logger.info(
-                "[evaluate] question_type=%s quality=%s len=%d",
-                question_type, quality, len(answer),
-            )
-            return {"evaluation": quality}
-
-        def should_retry(state: State) -> Literal["generate", "end"]:
-            """Condicional: retry ou END."""
-            if state["evaluation"] == "LOW_QUALITY" and state["retry_count"] < 2:
-                return "retrieve_retry"
-            else:
-                return "end"
-
-        def retrieve_retry(state: State) -> Dict[str, Any]:
-            """Nó: retry com estratégia diferente por tentativa.
-
-            Retry 1: remove threshold de similaridade → abre o funil, k=30.
-            Retry 2: expande a query com termos bilíngues + sem threshold, k=30.
+        def reformulate_and_retrieve(state: State) -> Dict[str, Any]:
+            """Nó: substitui `retrieve_retry`. Reformula `retrieval_query`
+            (condensada, não a pergunta crua — task 4.3) via
+            `_expand_query_for_retry` e recupera de novo, passando pelo
+            MESMO `_select_context_docs`/piso de recusa da tentativa
+            original (`_retrieve_docs_via_rpc` não tem mais nenhum
+            parâmetro de bypass desde a task 4.1) — nunca resgata com
+            contexto abaixo do piso que a tentativa original já teria
+            recusado. Volta para `grade_context` (loop), que julga de novo
+            com o novo contexto; `route_after_grade_context` usa
+            `reformulation_count` para nunca reformular uma 2ª vez.
             """
-            retry_count = state["retry_count"]
-            question = state["question"]
+            reformulated = self._expand_query_for_retry(state["retrieval_query"])
+            trace: Dict[str, Any] = {}
+            docs = self._retrieve_docs_via_rpc(
+                reformulated, k=RETRIEVAL_K_RETRY, use_llm_expansion=False, trace_out=trace
+            )
+            top_similarity = trace.get("top_similarity_raw", 0.0)
+            context_confidence = "strong" if top_similarity >= self.similarity_threshold else "partial"
+            question_type = state.get("question_type", "conceptual")
+            if question_type in ("conceptual", "quantitative"):
+                docs = self._add_data_companion_chunks(docs)
 
-            if retry_count == 0:
-                # Retry 1: remove threshold, mantém LLM expansion (já fez no retrieve inicial,
-                # mas aqui é nova chamada sem cache — roda LLM de novo intencionalmente)
-                logger.info("[retrieve_retry] tentativa=1 — removendo threshold, k=%d", RETRIEVAL_K_RETRY)
-                docs = self._retrieve_docs_via_rpc(
-                    question, k=RETRIEVAL_K_RETRY, skip_threshold=True, use_llm_expansion=True
-                )
-            else:
-                # Retry 2: expansão por regras bilíngues + sem threshold (diferente da LLM)
-                expanded = self._expand_query_for_retry(question)
-                logger.info("[retrieve_retry] tentativa=2 — expansão por regras, k=%d", RETRIEVAL_K_RETRY)
-                docs = self._retrieve_docs_via_rpc(
-                    expanded, k=RETRIEVAL_K_RETRY, skip_threshold=True, use_llm_expansion=False
-                )
-
+            reformulation_count = state.get("reformulation_count", 0) + 1
+            logger.info(
+                "[reformulate_and_retrieve] tentativa=%d query=%r ndocs=%d",
+                reformulation_count, reformulated, len(docs),
+            )
+            if not docs:
+                return {
+                    "context": "", "insufficient_context": True, "source_docs": [],
+                    "context_confidence": context_confidence,
+                    "retrieval_query": reformulated, "reformulation_count": reformulation_count,
+                }
             context = "\n\n".join(doc.page_content for doc in docs)
             return {
                 "context": context,
-                "retry_count": retry_count + 1,
+                "insufficient_context": False,
                 "source_docs": self._extract_source_doc_info(docs),
+                "context_confidence": context_confidence,
+                "retrieval_query": reformulated,
+                "reformulation_count": reformulation_count,
             }
 
+        def refuse_insufficient_context(state: State) -> Dict[str, Any]:
+            """Nó: a tentativa reformulada também foi `insufficient` —
+            recusa, sem 3ª tentativa (task 4.5). Reaproveita o caminho de
+            recusa gratuito que `generate` já tem via `insufficient_context`
+            (nunca chama o LLM de geração para um contexto que o próprio
+            sistema já julgou insuficiente duas vezes)."""
+            return {"insufficient_context": True, "context": "", "source_docs": []}
+
         workflow.add_node("retrieve", retrieve)
+        workflow.add_node("grade_context", grade_context)
+        workflow.add_node("reformulate_and_retrieve", reformulate_and_retrieve)
+        workflow.add_node("refuse_insufficient_context", refuse_insufficient_context)
         workflow.add_node("generate", generate)
+        workflow.add_node("verify_numeric", verify_numeric)
         workflow.add_node("evaluate", evaluate)
-        workflow.add_node("retrieve_retry", retrieve_retry)
         workflow.set_entry_point("retrieve")
-        workflow.add_edge("retrieve", "generate")
-        workflow.add_edge("generate", "evaluate")
+        workflow.add_edge("retrieve", "grade_context")
         workflow.add_conditional_edges(
-            "evaluate",
-            should_retry,
+            "grade_context",
+            route_after_grade_context,
             {
-                "retrieve_retry": "retrieve_retry",
-                "end": END,
+                "reformulate": "reformulate_and_retrieve",
+                "generate": "generate",
+                "give_up": "refuse_insufficient_context",
             },
         )
-        workflow.add_edge("retrieve_retry", "generate")
+        workflow.add_edge("reformulate_and_retrieve", "grade_context")
+        workflow.add_edge("refuse_insufficient_context", "generate")
+        workflow.add_edge("generate", "verify_numeric")
+        workflow.add_edge("verify_numeric", "evaluate")
+        workflow.add_edge("evaluate", END)
         return workflow.compile()
+
+    def _grade_context_verdict(self, question: str, context: str) -> str:
+        """Chama `llm_utility` com `_GRADE_CONTEXT_SYSTEM_PROMPT` e devolve
+        um veredito normalizado (`sufficient`/`partial`/`insufficient`).
+
+        Método próprio (não só um closure dentro de `_build_graph`) para ser
+        reaproveitado tanto pelo nó `grade_context` quanto pelo script de
+        calibração contra o golden set adversarial (task 2.3/3.x) — as duas
+        chamadas precisam do mesmo parsing, para a calibração nunca medir um
+        comportamento diferente do que roda em produção.
+        """
+        messages = [
+            SystemMessage(content=self._GRADE_CONTEXT_SYSTEM_PROMPT),
+            HumanMessage(content=f"**QUESTION:**\n{question}\n\n**CONTEXT:**\n{context}"),
+        ]
+        response = self.llm_utility.invoke(messages)
+        raw = response.content.strip().upper()
+        if "INSUFFICIENT" in raw:
+            return "insufficient"
+        if "PARTIAL" in raw:
+            return "partial"
+        if "SUFFICIENT" in raw:
+            return "sufficient"
+        # Resposta fora do formato esperado — mesma postura conservadora do
+        # resto do pipeline: não assume sufficient sem sinal claro.
+        logger.warning("[grade_context] resposta fora do formato esperado: %r", raw)
+        return "partial"
+
+    def _generate_answer_text(
+        self,
+        *,
+        question: str,
+        context: str,
+        language: str,
+        effective_type: str,
+        context_confidence: str,
+        history: List[List[str]],
+        correction_instruction: Optional[str] = None,
+    ) -> str:
+        """Monta o prompt e chama `llm_generation`, devolvendo o texto bruto
+        da resposta (sentinela de recusa ainda não tratado pelo chamador).
+
+        Compartilhado entre o nó `generate` e a regeneração de
+        `verify_numeric` — as duas chamadas precisam montar exatamente a
+        mesma mensagem (system prompt + ressalva de confiança parcial +
+        histórico + contexto/pergunta), diferindo só pela instrução de
+        correção opcional, para nunca divergirem silenciosamente.
+        """
+        lang_instruction = (
+            "Responda COMPLETAMENTE em português (pt-BR)."
+            if language == "pt-BR"
+            else "Respond COMPLETELY in English."
+        )
+        system_content = self._build_system_prompt(effective_type, lang_instruction)
+
+        # Confiança parcial: instrui o modelo a abrir sinalizando a
+        # incerteza em linguagem natural, em vez de responder com a mesma
+        # certeza de um contexto fortemente relacionado — implementa a
+        # postura escolhida (ressalva, não recusa, na zona de incerteza).
+        if context_confidence == "partial":
+            system_content += (
+                "\n\nThe retrieved context has only partial/moderate relevance to this "
+                "question. Open your answer by briefly signaling that uncertainty in "
+                "natural language (e.g. \"the available documents do not directly address "
+                "this, but the closest related information indicates...\"), and clearly "
+                "mark any part of the answer that is inference from related material "
+                "rather than a direct match."
+            )
+
+        if correction_instruction:
+            system_content += f"\n\n{correction_instruction}"
+
+        messages = [SystemMessage(content=system_content)]
+
+        for pair in history:
+            if len(pair) >= 1 and pair[0]:
+                messages.append(HumanMessage(content=pair[0]))
+            if len(pair) >= 2 and pair[1]:
+                messages.append(AIMessage(content=pair[1]))
+
+        current_message = f"**CONTEXT:**\n{context}\n\n**QUESTION:** {question}"
+        messages.append(HumanMessage(content=current_message))
+
+        response = self.llm_generation.invoke(messages)
+        return response.content.strip()
 
     def _embed_query(self, text: str) -> List[float]:
         """Gera embedding da query."""
@@ -978,6 +1275,37 @@ class RAGService:
             metadata = {}
         metadata["db_id"] = match["id"]
         metadata["similarity"] = match["similarity"]
+        return Document(
+            page_content=match["content"],
+            metadata=metadata,
+        )
+
+    def _search_lexical_rpc(self, query_terms: str, limit: int = 40) -> List[Dict[str, Any]]:
+        """Busca léxica via `rpc_lexical_search` — paralela a `_search_rpc`,
+        `rpc_vector_search` permanece intocada (ver design.md)."""
+        response = self.supabase_admin.rpc(
+            "rpc_lexical_search",
+            {"query_terms": query_terms, "limit_count": limit},
+        ).execute()
+        return response.data or []
+
+    def _normalize_lexical_match_doc(self, match: Dict[str, Any]) -> Document:
+        """Normaliza resultado de `rpc_lexical_search` em Document.
+
+        Não seta `similarity` — um doc encontrado só pela via léxica não tem
+        cosseno comparável (ver `_rrf_fuse`, que decide o que fazer com
+        isso); setar aqui um valor arbitrário arriscaria vazar para o piso
+        de recusa antes da hora.
+        """
+        metadata_raw = match.get("metadata")
+        if isinstance(metadata_raw, dict):
+            metadata = dict(metadata_raw)
+        elif isinstance(metadata_raw, str):
+            metadata = json.loads(metadata_raw) if metadata_raw else {}
+        else:
+            metadata = {}
+        metadata["db_id"] = match["id"]
+        metadata["lexical_score_raw"] = match.get("lexical_rank")
         return Document(
             page_content=match["content"],
             metadata=metadata,
@@ -1091,95 +1419,124 @@ class RAGService:
         # Default seguro: conceptual — o template é flexível e não exige seções rígidas
         return 'conceptual'
 
+    # Sentinela devolvido pelo modelo quando o contexto não permite responder
+    # — detectado em `generate` e substituído pela mensagem de recusa real.
+    # Ver design.md, decisão 4: cobre o caso em que o contexto EXISTE mas,
+    # mesmo com ressalva, não é suficiente — algo que o prompt antigo
+    # proibia expressar (forçava preencher seções com "não disponível").
+    NO_ANSWER_SENTINEL = "SEM_RESPOSTA_NO_CONTEXTO"
+
+    # Prompt de `grade_context` — julga suficiência semântica ANTES de gerar,
+    # porque similaridade de cosseno provadamente não separa in/out-of-corpus
+    # neste corpus (uma pergunta fora do escopo mediu 0.620, acima de
+    # perguntas legítimas em 0.539-0.544). Três estados, não dois — um
+    # binário reproduziria o mesmo problema do threshold escalar. Em modo
+    # observação (task 2), o resultado só é logado/gravado no State.
+    #
+    # Calibração (task 3, `run_grade_context_calibration.py`) contra as 35
+    # perguntas do golden set adversarial: 34/35 (97.1%) — 11/11 (100%) nos
+    # negativos fora do escopo, incluindo os dois marcados como mais difíceis
+    # no design.md (`oos-fis-carpa`, `oos-rpl-streptococcus` — mesmo
+    # vocabulário técnico e métrica do corpus, espécie/patógeno diferentes);
+    # 23/24 (95.8%) nas perguntas respondíveis. A única divergência,
+    # `fu-gen-menor-valor`, é uma das 4 perguntas de "maior e menor" já
+    # sinalizadas no design.md como candidatas à decomposição condicional do
+    # grupo 6 — não ajustado aqui de propósito, para não fazer o prompt
+    # "decorar" o conjunto de teste.
+    #
+    # Uma iteração real de calibração ocorreu: a primeira rodada julgava as 4
+    # perguntas de follow-up como `insufficient` (0/4) mesmo com contexto
+    # correto — não era o prompt, era a pergunta errada sendo julgada. O nó
+    # usava `state["question"]` (a pergunta crua, ex. "E qual teve o
+    # menor?"), ininteligível sem o turno anterior; `generate` não tem esse
+    # problema porque recebe o histórico completo como mensagens. Corrigido
+    # trocando para `state["retrieval_query"]` (condensada por `retrieve`,
+    # novo campo no `State`) — subiu de 31.4% para 97.1% de acurácia geral.
+    _GRADE_CONTEXT_SYSTEM_PROMPT = (
+        "You are grading whether retrieved document excerpts are sufficient to "
+        "answer a specific question, for a scientific Q&A system about tilapia "
+        "and other fish aquaculture research (nutrition, genetics, disease "
+        "challenge trials, economics).\n\n"
+        "Judge STRICTLY whether the context specifically addresses what the "
+        "question asks — not whether it is topically related. The most "
+        "important failure mode to catch: context that shares vocabulary, "
+        "metrics, or structure with the question but is actually about a "
+        "DIFFERENT subject — a different species, pathogen, treatment, "
+        "population, or study than the one the question asks about. That is "
+        "INSUFFICIENT even when it looks similar on the surface (same metric "
+        "name, similar numbers, same experimental design).\n\n"
+        "Respond with exactly one word:\n"
+        "SUFFICIENT — the context directly contains the specific information "
+        "needed to answer the question completely.\n"
+        "PARTIAL — the context is genuinely related to the question's subject "
+        "and contains some relevant information, but does not fully or "
+        "directly answer it.\n"
+        "INSUFFICIENT — the context does not address the question's actual "
+        "subject, including when it discusses a superficially similar topic "
+        "about a different species, pathogen, study, or entity.\n\n"
+        "Answer with ONLY one word: SUFFICIENT, PARTIAL, or INSUFFICIENT. No "
+        "explanation, no punctuation."
+    )
+
+    _QUESTION_TYPE_EMPHASIS = {
+        "quantitative": (
+            "This question calls for precision on numeric data: include exact figures, "
+            "n=, ±, %, p-values, and confidence intervals wherever the context provides them."
+        ),
+        "comparative": (
+            "This question calls for a comparison: organize the answer contrastively, "
+            "setting the compared items, groups, or treatments directly against each other."
+        ),
+        "methodological": (
+            "This question calls for methodology: follow the natural order of the experiment "
+            "or procedure as described in the context (design, procedures, measurements, analysis)."
+        ),
+        "conceptual": (
+            "This question calls for a conceptual explanation: explain what the concept means, "
+            "then its practical or biological relevance."
+        ),
+    }
+
     def _build_system_prompt(self, question_type: str, lang_instruction: str) -> str:
-        """Retorna o system prompt adequado ao tipo de pergunta."""
+        """System prompt: uma base única em prosa contínua + uma linha de
+        ênfase por tipo de pergunta.
 
-        if question_type == 'conceptual':
-            return (
-                f"You are an expert in tilapia aquaculture and fisheries science. {lang_instruction}\n\n"
-                f"Your task: Answer the question using ONLY the scientific context provided, "
-                f"with maximum fidelity to the original data.\n\n"
-                f"MANDATORY RESPONSE STRUCTURE:\n\n"
-                f"**Dados do Estudo:**\n"
-                f"List ALL numeric values found in the context relevant to the question. "
-                f"Format as a bullet table: '• [Variable] ([Population/Treatment]): [Value] ([unit/stat])'. "
-                f"Examples:\n"
-                f"  • Coeficiente de endogamia FIS (SAW): 0.44 — mais alto do estudo\n"
-                f"  • Coeficiente de endogamia FIS (ILH): 0.05 — mais baixo do estudo\n"
-                f"  • Distância genética DEST: 0.00–0.818 (variação entre pares)\n"
-                f"  • Área de filé por ultrassom (ILH/GIFT): 7.05 vs SAL: 3.04\n"
-                f"If no numeric data is found in the context: write 'Dados numéricos não disponíveis no contexto.'\n\n"
-                f"**Interpretação:**\n"
-                f"Explain what the data means, using the populations/treatments by name. "
-                f"Connect each numeric finding to its biological or practical significance as stated "
-                f"in the study. Do not extrapolate beyond what the authors conclude.\n\n"
-                f"**Implicações / Recomendações:**\n"
-                f"List only conclusions and recommendations explicitly stated in the context.\n\n"
-                f"GROUNDING RULES (mandatory):\n"
-                f"  • Every claim in Interpretação must link to a value in Dados do Estudo\n"
-                f"  • Name populations/stocks individually — never write 'algumas populações'\n"
-                f"  • Do NOT add general aquaculture knowledge not in the context\n"
-                f"  • Prefer 'O estudo encontrou X=Y' over 'X é geralmente importante para Y'\n"
-                f"  • If context is insufficient for a section, say so explicitly"
-            )
-
-        if question_type == 'comparative':
-            return (
-                f"You are an expert in tilapia aquaculture research. {lang_instruction}\n\n"
-                f"Your task: Compare and contrast based on the context provided.\n\n"
-                f"Use these exact section headers:\n\n"
-                f"COMPARISON:\n"
-                f"- Side-by-side comparison with numeric values where available\n"
-                f"- Organize by treatment groups, methods, or conditions\n\n"
-                f"KEY DIFFERENCES:\n"
-                f"- Main differences with supporting data (values, %, p-values)\n\n"
-                f"CONCLUSION:\n"
-                f"- Which performs better and under what conditions\n"
-                f"- Practical recommendation if applicable\n\n"
-                f"Include all available numeric values. Be objective and data-driven."
-            )
-
-        if question_type == 'methodological':
-            return (
-                f"You are an expert in tilapia aquaculture research. {lang_instruction}\n\n"
-                f"Your task: Describe the experimental methodology based on the context.\n\n"
-                f"Use these exact section headers:\n\n"
-                f"EXPERIMENTAL DESIGN:\n"
-                f"- Design type, treatments, groups, replication (n=)\n\n"
-                f"PROCEDURES:\n"
-                f"- Step-by-step methods, feeding protocols, duration\n\n"
-                f"MEASUREMENTS:\n"
-                f"- Variables measured, frequency, instruments\n\n"
-                f"STATISTICAL ANALYSIS:\n"
-                f"- Statistical tests, significance level, software used\n\n"
-                f"Include specific values wherever available. Write 'Not described.' if a section has no information."
-            )
-
-        # default: quantitative
+        Os 4 templates antigos (um por `question_type`, cada um com seus
+        próprios cabeçalhos de seção obrigatórios) eram ~90% estrutura
+        repetida — regras de fundamentação, instrução de idioma, instrução
+        de fidelidade — com um layout de seção diferente. Colapsados aqui
+        numa base + 4 linhas de ênfase (ver design.md de
+        restore-rag-answer-quality). Sem cabeçalho obrigatório: uma resposta
+        sem dado para uma seção antes virava um placeholder formal
+        ("Dados numéricos não disponíveis no contexto"), que é exatamente o
+        sintoma de "resposta vazia" que motivou esta mudança.
+        """
+        emphasis = self._QUESTION_TYPE_EMPHASIS.get(
+            question_type, self._QUESTION_TYPE_EMPHASIS["conceptual"]
+        )
         return (
-            f"You are an expert in tilapia aquaculture research, specialized in extracting "
-            f"quantitative data from scientific documents. {lang_instruction}\n\n"
-            f"Your task: Extract ALL numeric data from the context and answer with precise values.\n\n"
-            f"Use these exact section headers:\n\n"
-            f"DATA:\n"
-            f"- All relevant numeric values paired with their meaning\n"
-            f"- Reconstruct tables (pair headers with values)\n"
-            f"- Include: n=, ±, %, p-values, confidence intervals\n"
-            f"- Example: 'Weight gain: 45.2 ± 3.1 g (n=50, p<0.05)'\n"
-            f"- If no data found: 'Empty section.'\n\n"
-            f"METHODOLOGY:\n"
-            f"- Experimental design, sample size, duration, treatment groups, statistical methods\n"
-            f"- If not found: 'Empty section.'\n\n"
-            f"INTERPRETATION:\n"
-            f"- What the results mean; link numbers to biological/practical significance\n"
-            f"- If not found: 'Empty section.'\n\n"
-            f"LIMITATIONS:\n"
-            f"- Study limitations mentioned in the text\n"
-            f"- If not found: 'Empty section.'\n\n"
-            f"RULES: Never write section headers without content. "
-            f"Pair all numbers with their labels. Scan every line for digits. "
-            f"CRITICAL: when a section has no data in the context, write EXACTLY 'Empty section.' "
-            f"(do not translate or rephrase — this exact string is required for quality control)."
+            f"You are an expert in tilapia aquaculture and fisheries science. {lang_instruction}\n\n"
+            f"Answer the question directly and specifically, using ONLY the scientific context "
+            f"provided, with maximum fidelity to the original data.\n\n"
+            f"Write in continuous prose, organized in paragraphs — do not divide the answer into "
+            f"labeled sections or a fixed template. Use a bulleted or numbered list only where the "
+            f"content is a genuine enumeration (e.g. a sequence of steps, several parallel items) "
+            f"and a list genuinely aids readability — never as a mandatory structure applied "
+            f"regardless of content.\n\n"
+            f"Weave numeric values into the prose as you discuss them (e.g. \"the PRO+MOS treatment "
+            f"showed the highest relative protection level, 64.10%, against 21.02% for MOS\") rather "
+            f"than listing them in a separate data section. If an aspect of the question has no data "
+            f"in the context, address that briefly in a sentence or omit it — never as an empty "
+            f"labeled section or a placeholder value.\n\n"
+            f"GROUNDING RULES (mandatory):\n"
+            f"  • Name populations, treatments, or stocks individually — never write \"some populations\"\n"
+            f"  • Do NOT add general aquaculture knowledge not present in the context\n"
+            f"  • Prefer \"the study found X=Y\" over \"X is generally important for Y\"\n"
+            f"  • Do not extrapolate beyond what the authors conclude\n\n"
+            f"{emphasis}\n\n"
+            f"If the provided context does not contain the information needed to answer the "
+            f"question, respond with exactly the text `{self.NO_ANSWER_SENTINEL}` and nothing else "
+            f"— no partial answer, no apology, no explanation."
         )
 
     def _rewrite_query(self, question: str, lang: str) -> str:
@@ -1229,7 +1586,7 @@ class RAGService:
                 f"weight gain feed restriction Oreochromis niloticus compensatory growth "
                 f"crescimento compensatório desempenho zootécnico'"
             )
-            response = self.llm.invoke([HumanMessage(content=prompt)])
+            response = self.llm_utility.invoke([HumanMessage(content=prompt)])
             expanded = response.content.strip()
             # Validação mínima: resposta maior que a pergunta e contém termos da pergunta
             q_start = question[:20].lower()
@@ -1268,7 +1625,7 @@ class RAGService:
                 f"Pergunta de acompanhamento: {question}\n\n"
                 "Pergunta reescrita:"
             )
-            response = self.llm.invoke([HumanMessage(content=prompt)])
+            response = self.llm_utility.invoke([HumanMessage(content=prompt)])
             condensed = response.content.strip().strip('"')
             if condensed and len(condensed) >= 5:
                 logger.info(
@@ -1326,26 +1683,6 @@ class RAGService:
         answer_normalized = _norm(answer)
         return any(_norm(w) in answer_normalized for w in words)
 
-    def _data_section_has_numbers(self, answer: str) -> bool:
-        """Verifica se a seção DATA contém números reais (não só o cabeçalho)."""
-        if "DATA:" not in answer:
-            return False
-        data_start = answer.index("DATA:") + len("DATA:")
-        data_end = len(answer)
-        for section in ["METHODOLOGY:", "INTERPRETATION:", "LIMITATIONS:"]:
-            idx = answer.find(section, data_start)
-            if idx != -1 and idx < data_end:
-                data_end = idx
-        data_content = answer[data_start:data_end]
-        return (
-            bool(re.search(r'\d', data_content))
-            and "Empty section" not in data_content
-        )
-
-    def _count_empty_sections(self, answer: str) -> int:
-        """Conta ocorrências de 'Empty section' — penaliza respostas ocas."""
-        return answer.count("Empty section")
-
     # ── Auxiliar de retry ──────────────────────────────────────────────────────
 
     def _expand_query_for_retry(self, question: str) -> str:
@@ -1361,6 +1698,14 @@ class RAGService:
         logger.info("[retry] query expandida: %s", expanded)
         return expanded.strip()
 
+    # Reaproveitada por `_build_lexical_query` (add-hybrid-lexical-vector-search)
+    # — o antigo bônus de reranking manual que também a usava
+    # (`_get_rerank_terms`/`_score_doc_bonus`/`_rerank_docs`) foi removido:
+    # a fusão RRF é a versão correta e limitada do mesmo princípio (dar peso
+    # a casamento léxico), sem o problema do bônus antigo (somava até
+    # +0.2/+0.3 sem limite contra uma banda de decisão de 0.12, e casava por
+    # substring sem respeitar fronteira de palavra — "mos" casava dentro de
+    # "mostrar"). Ver design.md, decisão 6.
     _RERANK_STOPWORDS = {
         'o', 'a', 'os', 'as', 'um', 'uma', 'de', 'da', 'do', 'dos', 'das',
         'em', 'no', 'na', 'nos', 'nas', 'para', 'com', 'por', 'que', 'foi',
@@ -1369,34 +1714,82 @@ class RAGService:
         'which', 'and', 'or', 'to', 'from', 'this', 'that', 'with',
     }
 
-    def _get_rerank_terms(self, question: str, rewritten_question: str) -> List[str]:
-        """Extrai termos de conteúdo da própria pergunta para o bônus de reranking.
+    # Preserva `.` entre dígitos para que "64.10"/"1.26" sobrevivam como um
+    # único token (não dois) — a busca vetorial já dilui esses valores; a
+    # léxica só ajuda se eles chegarem inteiros ao `to_tsquery`.
+    _LEXICAL_TOKEN_RE = re.compile(r"[a-z0-9]+(?:\.[0-9]+)*")
 
-        Generaliza o sinal: antes eram 3 listas fixas de termos hardcoded,
-        específicas dos temas do golden set atual (tilápia/nilo, restrição
-        alimentar, metabolismo) — não generalizavam para perguntas fora
-        desses assuntos exatos. Agora deriva de qualquer pergunta.
+    def _build_lexical_query(self, question: str, rewritten_question: str) -> str:
+        """Constrói os termos para `rpc_lexical_search`, unidos por `|`
+        (OR) — nunca `&` (AND). `websearch_to_tsquery`/`plainto_tsquery`
+        uniriam por AND por padrão, o que faria uma pergunta com vários
+        termos não bater com nada a menos que TODOS os termos estivessem no
+        mesmo chunk (ver design.md, decisão 4).
+
+        NFKD + remoção de diacríticos antes de tokenizar — mitigação parcial
+        de acentuação do lado Python (`unaccent` completo é melhoria
+        futura, não-goal deste change). Reaproveita `_RERANK_STOPWORDS` em
+        vez de manter uma segunda lista.
+
+        Limiar de tamanho mínimo é 2, não >4 como no antigo bônus de
+        reranking — siglas do domínio como "KV", "FIS", "RPL" são
+        exatamente os termos que esta busca existe para capturar, e um
+        limiar de 4+ as excluiria todas.
         """
         combined = f"{question} {rewritten_question}".lower()
-        words = (w.strip('?.,!():;"\'') for w in combined.split())
-        return list({w for w in words if len(w) > 4 and w not in self._RERANK_STOPWORDS})
+        normalized = unicodedata.normalize("NFKD", combined)
+        stripped = "".join(c for c in normalized if not unicodedata.combining(c))
+        tokens = self._LEXICAL_TOKEN_RE.findall(stripped)
+        terms = [t for t in tokens if len(t) >= 2 and t not in self._RERANK_STOPWORDS]
+        if not terms:
+            return ""
+        # Preserva ordem de primeira aparição, remove duplicatas — a ordem
+        # não afeta o ranking (`to_tsquery` com `|` é comutativo), mas uma
+        # query menor é mais barata de parsear no Postgres.
+        deduped_terms = list(dict.fromkeys(terms))
+        return " | ".join(deduped_terms)
 
-    def _score_doc_bonus(self, doc: Document, terms: List[str]) -> float:
-        """Bônus lexical para reranking."""
-        doc_lower = doc.page_content.lower()
-        matches = sum(1 for term in terms if term in doc_lower)
-        return matches * 0.02
+    def _rrf_fuse(
+        self,
+        vector_docs: List[Document],
+        lexical_docs: List[Document],
+        rrf_k: int = RRF_K,
+    ) -> List[Document]:
+        """Funde duas listas rankeadas (vetorial + léxica) via Reciprocal
+        Rank Fusion: `score += 1/(rrf_k + rank)` por lista, usando só a
+        POSIÇÃO de cada doc em cada lista — cosseno e `ts_rank_cd` vivem em
+        escalas incompatíveis, RRF evita ter que normalizá-las (ver
+        design.md, decisão 3).
 
-    def _rerank_docs(self, docs: List[Document], question: str, rewritten_question: str) -> List[Document]:
-        """Reranking leve pós-dedup."""
-        terms = self._get_rerank_terms(question, rewritten_question)
+        Docs encontrados só pela via léxica (ausentes de `vector_docs`)
+        carregam `metadata["lexical_rank"]` — usado por `_select_context_docs`
+        para excluí-los do piso de recusa por cosseno, que eles não têm
+        (ver design.md, decisão 5, e grupo 4 de tasks.md).
+        """
+        scores: Dict[str, float] = {}
+        doc_by_key: Dict[str, Document] = {}
+        vector_keys = set()
 
-        def rerank_key(d: Document) -> float:
-            sim = d.metadata.get("similarity", 0.0)
-            bonus = self._score_doc_bonus(d, terms)
-            return sim + bonus
+        for rank, doc in enumerate(vector_docs):
+            key = self._make_retrieval_dedup_key(doc)
+            vector_keys.add(key)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (rrf_k + rank + 1)
+            doc_by_key[key] = doc
 
-        return sorted(docs, key=rerank_key, reverse=True)
+        for rank, doc in enumerate(lexical_docs):
+            key = self._make_retrieval_dedup_key(doc)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (rrf_k + rank + 1)
+            if key not in vector_keys:
+                doc.metadata["lexical_rank"] = rank
+                doc_by_key[key] = doc
+            # Já visto pela via vetorial: mantém o Document original (com
+            # `similarity` real), só a fusão do score conta esse rank também.
+
+        return sorted(
+            doc_by_key.values(),
+            key=lambda d: scores[self._make_retrieval_dedup_key(d)],
+            reverse=True,
+        )
 
     def _is_text_garbled(self, text: str, threshold: float = 0.04) -> bool:
         """Detecta texto com problema de encoding: muitos '?' indicam caracteres não decodificados."""
@@ -1411,29 +1804,35 @@ class RAGService:
             return True
         return self._is_text_garbled(context)
 
-    def _add_data_companion_chunks(
-        self,
-        docs: List[Document],
-        max_companions: int = 5,
-    ) -> List[Document]:
-        """Injeta os chunks mais ricos em dados do mesmo arquivo que ficaram fora da busca semântica.
-
-        Para perguntas conceptuais/implicações, a busca semântica retorna os chunks de
-        discussão/conclusão com alta similaridade, mas esses chunks não contêm as tabelas
-        e métricas (FIS, DEST, p-values) que suportam as afirmações. Este método adiciona
-        os N chunks com maior densidade numérica de cada arquivo já presente no contexto.
+    def _add_data_companion_chunks(self, docs: List[Document]) -> List[Document]:
+        """Injeta os chunks mais ricos em dados (tabelas/métricas) que
+        ficaram fora da busca semântica — hoje a única fonte de certas
+        tabelas (FIS, RPL) que a busca vetorial sozinha não recupera bem
+        (ver design.md de restore-rag-answer-quality). Limitado, não
+        removido: teto TOTAL (`DATA_COMPANION_MAX_TOTAL`, não por arquivo —
+        o comportamento antigo por arquivo podia injetar até 5×N chunks de
+        arquivos irrelevantes), elegibilidade restrita a arquivos já
+        presentes no top-3 do ranking, e conta contra
+        `CONTEXT_CHAR_BUDGET` (o orçamento já é calculado sobre `docs`
+        antes desta chamada).
         """
-        present_ids = {d.metadata.get("db_id") for d in docs}
-        file_ids = {
-            d.metadata.get("original_file_id")
-            for d in docs
-            if d.metadata.get("original_file_id")
-        }
-        if not file_ids:
+        if not DATA_COMPANION_ENABLED or not docs:
             return docs
 
-        companions: List[Document] = []
-        for file_id in file_ids:
+        present_ids = {d.metadata.get("db_id") for d in docs}
+        eligible_file_ids = {
+            d.metadata.get("original_file_id")
+            for d in docs[:3]
+            if d.metadata.get("original_file_id")
+        }
+        if not eligible_file_ids:
+            return docs
+
+        used_chars = sum(len(d.page_content) for d in docs)
+        remaining_budget = max(CONTEXT_CHAR_BUDGET - used_chars, 0)
+
+        candidates: List[Dict[str, Any]] = []
+        for file_id in eligible_file_ids:
             try:
                 resp = (
                     self.supabase_admin.table("documents")
@@ -1441,46 +1840,112 @@ class RAGService:
                     .filter("metadata->>original_file_id", "eq", file_id)
                     .execute()
                 )
-                # Ordenar por densidade de dígitos — chunks de tabelas têm muitos números
-                def digit_density(row: Dict[str, Any]) -> float:
-                    c = row.get("content", "")
-                    return sum(1 for ch in c if ch.isdigit()) / max(len(c), 1)
-
-                sorted_rows = sorted(resp.data, key=digit_density, reverse=True)
-                added = 0
-                for row in sorted_rows:
-                    if added >= max_companions:
-                        break
-                    db_id = row["id"]
-                    if db_id in present_ids:
-                        continue
-                    meta = dict(row.get("metadata") or {})
-                    meta["db_id"] = db_id
-                    meta["similarity"] = 0.0   # não veio da busca semântica
-                    meta["companion"] = True
-                    companions.append(Document(page_content=row["content"], metadata=meta))
-                    present_ids.add(db_id)
-                    added += 1
+                candidates.extend(resp.data or [])
             except Exception as exc:
                 logger.warning("[data_companion] falha ao buscar chunks de %s: %s", file_id, exc)
 
+        # Ordenar globalmente por densidade de dígitos — chunks de tabelas
+        # têm muitos números. Pool único entre os arquivos elegíveis: o
+        # teto é sobre o total, não garantido por arquivo.
+        def digit_density(row: Dict[str, Any]) -> float:
+            c = row.get("content", "")
+            return sum(1 for ch in c if ch.isdigit()) / max(len(c), 1)
+
+        candidates.sort(key=digit_density, reverse=True)
+
+        companions: List[Document] = []
+        for row in candidates:
+            if len(companions) >= DATA_COMPANION_MAX_TOTAL:
+                break
+            db_id = row["id"]
+            if db_id in present_ids:
+                continue
+            content = row.get("content", "")
+            if len(content) > remaining_budget:
+                continue
+            meta = dict(row.get("metadata") or {})
+            meta["db_id"] = db_id
+            meta["similarity"] = 0.0   # não veio da busca semântica
+            meta["companion"] = True
+            companions.append(Document(page_content=content, metadata=meta))
+            present_ids.add(db_id)
+            remaining_budget -= len(content)
+
         if companions:
-            logger.info("[data_companion] adicionando %d chunks de dados ao contexto", len(companions))
+            logger.info(
+                "[data_companion] adicionando %d/%d chunks de dados ao contexto (%d arquivos elegíveis)",
+                len(companions), DATA_COMPANION_MAX_TOTAL, len(eligible_file_ids),
+            )
         return docs + companions
+
+    def _has_discriminative_lexical_match(self, question: str, rewritten_question: str) -> bool:
+        """Verifica se ALGUM termo discriminativo da pergunta casa
+        lexicalmente no corpus — segundo sinal de recusa, independente da
+        similaridade de cosseno (ver design.md, decisão 5).
+
+        "Discriminativo" exclui termos genéricos do domínio (frequência de
+        documento acima de `LEXICAL_DISCRIMINATIVE_MAX_DOC_FREQ`) que
+        casam com quase todo chunk e não ajudam a distinguir uma pergunta
+        dentro do escopo de uma fora — medido: "tilapia" aparece em 64.5%
+        dos chunks, "rpl" em 1.6%.
+
+        Postura conservadora nas bordas: sem termos para checar, ou se a
+        consulta de frequência falhar, não bloqueia (devolve True) — este
+        é um sinal COMPLEMENTAR ao piso de cosseno, nunca deve ser a única
+        fonte de uma recusa por causa de uma falha de infraestrutura.
+        """
+        lexical_query = self._build_lexical_query(question, rewritten_question)
+        if not lexical_query:
+            return True
+
+        terms = lexical_query.split(" | ")
+        try:
+            response = self.supabase_admin.rpc(
+                "rpc_lexical_term_doc_freq",
+                {"terms": terms},
+            ).execute()
+            freqs = response.data or []
+        except Exception:
+            logger.warning(
+                "[lexical_coverage] falha ao consultar frequência de termos — não bloqueia",
+                exc_info=True,
+            )
+            return True
+
+        for row in freqs:
+            total = row.get("total_docs") or 0
+            doc_count = row.get("doc_count") or 0
+            if total <= 0:
+                continue
+            freq = doc_count / total
+            if 0 < freq <= LEXICAL_DISCRIMINATIVE_MAX_DOC_FREQ:
+                return True
+        return False
 
     def _retrieve_docs_via_rpc(
         self,
         question: str,
         k: int = RETRIEVAL_K,
-        skip_threshold: bool = False,
         use_llm_expansion: bool = True,
+        trace_out: Optional[Dict[str, Any]] = None,
     ) -> List[Document]:
         """Recuperação via RPC com k variável.
 
+        Sempre passa pelo piso de recusa (`_select_context_docs`) — não há
+        mais um parâmetro de bypass. O antigo `skip_threshold` existia só
+        para o caminho de retry (`retrieve_retry`), removido em
+        `add-rag-self-correction-loop`: a nova tentativa de reformulação
+        (`grade_context` → reformular query) passa pelo MESMO piso de
+        recusa da tentativa original, nunca o ignora — ver design.md.
+
         Args:
-            skip_threshold:    se True, ignora o filtro de similaridade (retries).
             use_llm_expansion: se True, usa LLM para expandir a query (recuperação inicial).
                                Retries usam expansão por regras para evitar dupla chamada.
+            trace_out:         se um dict for passado, é preenchido com métricas da
+                               decisão de seleção (candidate_count, top_similarity_raw —
+                               ANTES do gate, ao contrário do que os chamadores veem no
+                               retorno — selected_count, context_chars, selection_reason).
+                               Usado pelo harness de avaliação; produção não precisa passar isso.
         """
         lang = self._detect_question_language(question)
         if use_llm_expansion:
@@ -1496,50 +1961,172 @@ class RAGService:
             current_sim = doc.metadata.get("similarity", 0)
             if key not in seen or current_sim > seen[key].metadata.get("similarity", 0):
                 seen[key] = doc
-        deduped = sorted(
+        vector_docs = sorted(
             seen.values(),
             key=lambda d: d.metadata.get("similarity", 0),
             reverse=True,
         )
-        deduped = self._rerank_docs(deduped, question, rewritten_question)
 
-        if skip_threshold:
-            logger.info("[retrieve] threshold ignorado (retry) — %d docs", len(deduped))
+        # Capturado ANTES do gate e ANTES da fusão híbrida — a decisão de
+        # recusa e esta métrica de observabilidade usam sempre o cosseno
+        # bruto da busca vetorial pura, nunca o ranking fundido por RRF
+        # (ver `_select_context_docs`/design.md de
+        # add-hybrid-lexical-vector-search, decisão 5).
+        candidate_count = len(vector_docs)
+        top_similarity_raw = vector_docs[0].metadata.get("similarity", 0) if vector_docs else 0.0
+
+        if HYBRID_SEARCH_ENABLED:
+            lexical_query = self._build_lexical_query(question, rewritten_question)
+            lexical_docs: List[Document] = []
+            if lexical_query:
+                lexical_matches = self._search_lexical_rpc(lexical_query, k)
+                lexical_docs = [self._normalize_lexical_match_doc(m) for m in lexical_matches]
+            ranked = self._rrf_fuse(vector_docs, lexical_docs, rrf_k=RRF_K)
+            logger.info(
+                "[retrieve] híbrida: %d vetoriais, %d léxicos, %d fundidos",
+                len(vector_docs), len(lexical_docs), len(ranked),
+            )
         else:
-            above = [d for d in deduped if d.metadata.get("similarity", 0) >= self.similarity_threshold]
-            if above:
-                logger.info(
-                    "[retrieve] %d/%d docs acima do threshold %.2f (scores: %.3f–%.3f)",
-                    len(above), len(deduped),
-                    self.similarity_threshold,
-                    above[-1].metadata.get("similarity", 0),
-                    above[0].metadata.get("similarity", 0),
-                )
-                deduped = above
-            else:
-                best_score = deduped[0].metadata.get("similarity", 0) if deduped else 0
-                if best_score >= REFUSAL_FLOOR_SIMILARITY:
-                    # Zona fraca: nada supera o threshold de confiança alta, mas o
-                    # melhor candidato ainda supera o piso de recusa. Mantém TODOS
-                    # os candidatos (não só o top-1) — restringir a 1 chunk aqui
-                    # sacrificaria recall de perguntas legítimas que caem nessa
-                    # zona só por causa da sobreposição real entre as distribuições
-                    # de similaridade de perguntas respondíveis e fora do escopo
-                    # (ver design.md de retrieval-refusal-quality).
-                    logger.warning(
-                        "[retrieve] Nenhum doc acima do threshold %.2f — zona fraca, "
-                        "mantendo %d candidatos (melhor score=%.3f, acima do piso %.2f)",
-                        self.similarity_threshold, len(deduped), best_score, REFUSAL_FLOOR_SIMILARITY,
-                    )
-                else:
-                    logger.warning(
-                        "[retrieve] Nenhum doc atinge o piso de recusa %.2f "
-                        "(melhor score=%.3f) — recusando",
-                        REFUSAL_FLOOR_SIMILARITY, best_score,
-                    )
-                    deduped = []
+            ranked = vector_docs
 
-        return deduped[:k]
+        selected, selection_reason = self._select_context_docs(ranked)
+
+        # Sinal complementar de recusa (grupo 5 de add-hybrid-lexical-vector-search):
+        # só roda na zona intermediária (entre o piso de recusa e o limiar
+        # de confiança alta), onde o cosseno sozinho provadamente não
+        # separa in/out-of-corpus (ver design.md). Nunca roda quando a
+        # decisão de cosseno já recusou (nada a reforçar) nem quando a
+        # similaridade já está acima do limiar de confiança (um match
+        # lexical não pode "resgatar" uma recusa por cosseno, nem a
+        # ausência de um pode enfraquecer uma confiança já alta).
+        if (
+            HYBRID_SEARCH_ENABLED
+            and selection_reason != "refused"
+            and REFUSAL_FLOOR_SIMILARITY <= top_similarity_raw < PRIMARY_RPC_SIMILARITY_THRESHOLD
+            and not self._has_discriminative_lexical_match(question, rewritten_question)
+        ):
+            logger.warning(
+                "[retrieve] zona intermediária (score=%.3f) sem termo discriminativo "
+                "casando lexicalmente — recusando (sinal complementar de cobertura léxica)",
+                top_similarity_raw,
+            )
+            selected = []
+            selection_reason = "refused_no_lexical_coverage"
+
+        if selection_reason in ("refused", "refused_no_lexical_coverage"):
+            logger.warning(
+                "[retrieve] Nenhum doc atinge o piso de recusa %.2f (melhor score=%.3f) — recusando",
+                REFUSAL_FLOOR_SIMILARITY, top_similarity_raw,
+            )
+        else:
+            logger.info(
+                "[retrieve] seleção=%s: %d/%d candidatos (melhor score=%.3f, %d chars)",
+                selection_reason, len(selected), candidate_count, top_similarity_raw,
+                sum(len(d.page_content) for d in selected),
+            )
+
+        if trace_out is not None:
+            trace_out.update({
+                "candidate_count": candidate_count,
+                "top_similarity_raw": top_similarity_raw,
+                "selected_count": len(selected),
+                "context_chars": sum(len(d.page_content) for d in selected),
+                "selection_reason": selection_reason,
+            })
+
+        return selected
+
+    def _select_context_docs(self, ranked: List[Document]) -> Tuple[List[Document], str]:
+        """Seleciona o contexto final por ranking, com piso mínimo e teto
+        máximo de chunks e orçamento de caracteres.
+
+        Substitui o regime binário antigo (só chunks acima do threshold de
+        confiança alta, ou TODOS os candidatos na "zona fraca"). Medido no
+        golden set: esse regime nunca selecionava algo entre 7 e 39 chunks —
+        só fome (1-6, causa da maioria das falhas reais) ou inundação (40,
+        ~48% do corpus inteiro em caracteres). Ver design.md.
+
+        Retorna (docs_selecionados, motivo), onde motivo é usado só para
+        observabilidade/trace, não para decisão de chamador.
+        """
+        if not ranked:
+            return [], "refused"
+
+        # Piso de recusa e janela relativa usam sempre o cosseno bruto do
+        # melhor candidato ENTRE OS QUE VIERAM DA BUSCA VETORIAL — nunca a
+        # posição no ranking fundido por RRF (quando a busca híbrida está
+        # ativa), e nunca a similaridade de um doc léxico-only (sinalizado
+        # por `metadata["lexical_rank"]`, que não tem cosseno comparável).
+        # O piso foi calibrado contra cosseno puro; um score fundido não
+        # tem calibração equivalente (ver design.md de
+        # add-hybrid-lexical-vector-search, decisão 5 e riscos). Quando a
+        # busca híbrida está desligada, `ranked` nunca contém docs
+        # léxico-only, então isto reduz exatamente ao comportamento
+        # anterior (top = similaridade do primeiro candidato).
+        vector_similarities = [
+            d.metadata.get("similarity", 0.0)
+            for d in ranked
+            if "lexical_rank" not in d.metadata
+        ]
+        top = max(vector_similarities) if vector_similarities else 0.0
+        if top < REFUSAL_FLOOR_SIMILARITY:
+            return [], "refused"
+
+        # Janela relativa ao melhor score — controla a FORMA da seleção.
+        # Docs léxico-only nunca são cortados por este piso de cosseno (não
+        # têm um score comparável) — sua posição no ranking fundido já
+        # reflete a relevância léxica deles.
+        floor = max(CONTEXT_ABSOLUTE_FLOOR, top - CONTEXT_RELATIVE_MARGIN)
+        selected = [
+            d for d in ranked
+            if "lexical_rank" in d.metadata or d.metadata.get("similarity", 0.0) >= floor
+        ]
+        reason = "relative_window"
+
+        # Preenchimento mínimo — nunca deixa a pergunta faminta, mesmo que a
+        # janela relativa tenha produzido poucos candidatos.
+        if len(selected) < CONTEXT_MIN_CHUNKS:
+            selected = ranked[:CONTEXT_MIN_CHUNKS]
+            reason = "min_fill"
+
+        # Teto — nunca deixa a pergunta afogada, mesmo com muitos candidatos fortes.
+        selected = selected[:CONTEXT_MAX_CHUNKS]
+
+        # Orçamento de caracteres, nunca cortando abaixo do mínimo garantido.
+        budgeted: List[Document] = []
+        used_chars = 0
+        for i, doc in enumerate(selected):
+            doc_chars = len(doc.page_content)
+            if used_chars + doc_chars > CONTEXT_CHAR_BUDGET and i >= CONTEXT_MIN_CHUNKS:
+                break
+            budgeted.append(doc)
+            used_chars += doc_chars
+
+        return budgeted, reason
+
+    def retrieve_for_eval(
+        self,
+        question: str,
+        history: Optional[List[List[str]]] = None,
+        k: int = RETRIEVAL_K,
+        use_llm_expansion: bool = True,
+    ) -> Tuple[List[Document], Dict[str, Any]]:
+        """Recuperação com condensação de follow-up, para o harness de avaliação.
+
+        Não é API de produção — existe para que `evaluation/run_eval.py` exercite
+        exatamente o mesmo caminho de condensação que o nó `retrieve` do grafo usa
+        (via `_condense_followup_question`), em vez de medir a pergunta crua e
+        reportar recall artificialmente baixo em perguntas de follow-up. Não expor
+        via `main.py`/HTTP.
+        """
+        lang = self._detect_question_language(question)
+        retrieval_query = self._condense_followup_question(question, history or [], lang)
+        trace: Dict[str, Any] = {}
+        docs = self._retrieve_docs_via_rpc(
+            retrieval_query, k=k, use_llm_expansion=use_llm_expansion, trace_out=trace
+        )
+        trace["retrieval_query"] = retrieval_query
+        return docs, trace
 
 
 _rag_service_instance = None

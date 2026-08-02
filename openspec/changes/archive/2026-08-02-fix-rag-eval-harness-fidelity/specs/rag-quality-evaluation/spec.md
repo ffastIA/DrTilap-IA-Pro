@@ -1,30 +1,4 @@
-# rag-quality-evaluation
-
-## Purpose
-
-Provide an objective, reproducible way to measure the quality of the DrTilápIA RAG pipeline — retrieval accuracy, answer grounding, correct refusal on out-of-scope questions, cost, and latency — against a versioned golden set of questions, so that RAG configuration changes can be evaluated and compared against a recorded baseline instead of judged by impression. This capability only observes and measures; it does not alter the production RAG query path.
-## Requirements
-### Requirement: Versioned evaluation set
-The system SHALL provide a versioned evaluation set ("golden set") of questions derived from the documents actually indexed in the vector base. Each entry SHALL declare the expected source document and the passage(s) that a correct retrieval must return, and SHALL be stored as reviewable data separate from execution code.
-
-#### Scenario: Answerable question declares its expected sources
-- **WHEN** an evaluation entry describes a question that the indexed documents can answer
-- **THEN** the entry names the source document and the passage(s) that retrieval is expected to return
-
-#### Scenario: Evaluation set is reviewable in isolation
-- **WHEN** a question is added, changed, or removed from the evaluation set
-- **THEN** the change is visible as a data diff without modifying the evaluation execution code
-
-### Requirement: Out-of-scope questions are part of the evaluation set
-The evaluation set SHALL include questions whose answers are absent from the indexed documents, so that the system's ability to decline honestly can be measured. This SHALL include both questions that are lexically unrelated to the corpus and questions that share vocabulary, entities, or structure with the corpus but ask about something the corpus does not cover — so that refusal is calibrated against genuinely hard negatives, not only easy ones.
-
-#### Scenario: Question outside the corpus is marked as such
-- **WHEN** the evaluation set contains a question about a subject not covered by any indexed document
-- **THEN** that entry is explicitly marked as out-of-scope and its expected outcome is a refusal rather than an answer
-
-#### Scenario: Near-miss out-of-scope question shares vocabulary with the corpus
-- **WHEN** the evaluation set contains a question that reuses in-corpus terminology, metrics, or named studies but changes the subject (e.g. the correct species, pathogen, or entity swapped for an incorrect one)
-- **THEN** that entry is marked out-of-scope with the same refusal expectation as a lexically distant question
+## MODIFIED Requirements
 
 ### Requirement: Multi-turn follow-up questions are part of the evaluation set
 The evaluation set SHALL include multi-turn sequences where a later question is only interpretable given the preceding turns, so that conversational context handling can be measured. Both retrieval-only and full evaluation modes SHALL exercise that history — a follow-up entry SHALL NOT be evaluated using only the literal text of its final turn.
@@ -36,17 +10,6 @@ The evaluation set SHALL include multi-turn sequences where a later question is 
 #### Scenario: Retrieval-only evaluation of a follow-up uses history
 - **WHEN** a retrieval-only evaluation run processes an entry that carries prior conversation turns
 - **THEN** the retrieval query used is derived from the question together with that history, using the same history-aware retrieval path the production system uses — not the bare final-turn text evaluated in isolation
-
-### Requirement: Retrieval quality is measured independently of answer generation
-The evaluation SHALL report retrieval metrics — whether the expected passages were retrieved, and at what similarity — without requiring answer generation, so that retrieval changes can be evaluated cheaply.
-
-#### Scenario: Retrieval-only evaluation run
-- **WHEN** an evaluation run is executed in retrieval-only mode
-- **THEN** it reports, per question, whether the expected passages were retrieved and their similarity scores, and it does not invoke answer generation
-
-#### Scenario: Missed passage is visible
-- **WHEN** an expected passage is not present in the retrieved results for a question
-- **THEN** the run reports that question as a retrieval miss rather than silently passing
 
 ### Requirement: Answer grounding is measured
 The evaluation SHALL report, for each generated answer, whether its claims are supported by the retrieved context, using an assessment independent of the model call that produced the answer. The grounding assessment SHALL be made against the same context that was actually supplied to the answer-generating call, not a context obtained through an independent, differently-configured retrieval.
@@ -63,13 +26,6 @@ The evaluation SHALL report, for each generated answer, whether its claims are s
 - **WHEN** grounding is assessed for a generated answer
 - **THEN** the judge receives the exact context that was passed to the generation call for that answer, not context obtained by re-running retrieval with different parameters
 
-### Requirement: Correct refusal is measured
-The evaluation SHALL report whether out-of-scope questions produced a refusal, and SHALL treat an answer to an out-of-scope question as a failure.
-
-#### Scenario: System answers an out-of-scope question
-- **WHEN** an out-of-scope question receives a substantive answer instead of a refusal
-- **THEN** the run reports that entry as a failure
-
 ### Requirement: Runs are recorded with the configuration that produced them
 Each evaluation run's persisted configuration record SHALL include, in one place, the embedding model, chunk size and overlap, similarity threshold, retrieval `k`, and whether LLM-based query expansion was enabled — so that the configuration record alone (not fields scattered elsewhere in the run, and not the run's filename or label) is sufficient to compare two runs meaningfully.
 
@@ -81,19 +37,18 @@ Each evaluation run's persisted configuration record SHALL include, in one place
 - **WHEN** a previous run and a current run are compared
 - **THEN** the comparison shows both the metric deltas and the configuration differences between them, read from each run's recorded configuration
 
-### Requirement: Runs report cost and latency
-Each evaluation run SHALL report the latency per question and the API cost incurred, so that quality gains can be weighed against their operational cost.
+### Requirement: Out-of-scope questions are part of the evaluation set
+The evaluation set SHALL include questions whose answers are absent from the indexed documents, so that the system's ability to decline honestly can be measured. This SHALL include both questions that are lexically unrelated to the corpus and questions that share vocabulary, entities, or structure with the corpus but ask about something the corpus does not cover — so that refusal is calibrated against genuinely hard negatives, not only easy ones.
 
-#### Scenario: Run reports its cost
-- **WHEN** an evaluation run completes
-- **THEN** it reports the total API cost of the run and the per-question latency
+#### Scenario: Question outside the corpus is marked as such
+- **WHEN** the evaluation set contains a question about a subject not covered by any indexed document
+- **THEN** that entry is explicitly marked as out-of-scope and its expected outcome is a refusal rather than an answer
 
-### Requirement: A baseline of the current system is recorded
-A baseline evaluation run SHALL be recorded against the RAG configuration as it exists before any optimization change, and retained for comparison.
+#### Scenario: Near-miss out-of-scope question shares vocabulary with the corpus
+- **WHEN** the evaluation set contains a question that reuses in-corpus terminology, metrics, or named studies but changes the subject (e.g. the correct species, pathogen, or entity swapped for an incorrect one)
+- **THEN** that entry is marked out-of-scope with the same refusal expectation as a lexically distant question
 
-#### Scenario: Baseline exists before optimization
-- **WHEN** a subsequent RAG optimization change is evaluated
-- **THEN** a stored baseline run produced by the pre-optimization configuration is available to compare against
+## ADDED Requirements
 
 ### Requirement: Mention-coverage scoring is robust to equivalent numeric formatting
 When comparing a required mention against generated text, the evaluation SHALL treat numerically equivalent representations (decimal comma vs. decimal point, and equivalent digit notations) as matching, so that a factually correct answer is not scored as missing a value due to formatting differences alone.
@@ -152,4 +107,3 @@ For questions where the evaluation set declares an expected source document, eac
 #### Scenario: Over-citation is visible
 - **WHEN** an answer cites source documents beyond the one(s) declared as expected for that question
 - **THEN** the run's per-question detail records the discrepancy rather than silently averaging it away
-

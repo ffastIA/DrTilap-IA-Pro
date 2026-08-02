@@ -4,8 +4,10 @@ import api from '@/lib/api';
 
 export interface ChatSource {
   file: string;
-  page_start: number | null;
-  page_end: number | null;
+  // Páginas discretas (0-indexed) realmente presentes nos trechos usados —
+  // não mais um span min/max, que sugeria que todo o intervalo entre a
+  // menor e a maior página tinha sido usado.
+  pages: number[];
 }
 
 interface ChatMessage {

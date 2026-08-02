@@ -48,6 +48,90 @@ PRIMARY_RPC_SIMILARITY_THRESHOLD = float(os.getenv("PRIMARY_RPC_SIMILARITY_THRES
 # do escopo medido (0.512) — ver tasks.md de retrieval-refusal-quality.
 REFUSAL_FLOOR_SIMILARITY = float(os.getenv("REFUSAL_FLOOR_SIMILARITY", "0.53"))
 
+# ── Seleção de contexto por ranking (restore-rag-answer-quality) ────────────
+# Substitui o regime binário antigo (só acima do threshold, ou todos os 40
+# candidatos na "zona fraca") — medido no golden set que esse regime nunca
+# selecionava algo entre 7 e 39 chunks: só fome (1-6, causa da maioria das
+# falhas reais medidas) ou inundação (40, ~48% do corpus inteiro em chars).
+
+# Preenchimento mínimo garantido mesmo quando a janela relativa (abaixo)
+# produzir menos candidatos que isso — elimina a fome. Rank do primeiro
+# chunk correto em perguntas com expansão de query chega a 8 (bip-rpl-extremos);
+# um mínimo menor voltaria a starvar essas perguntas.
+CONTEXT_MIN_CHUNKS = int(os.getenv("CONTEXT_MIN_CHUNKS", "8"))
+
+# Teto de chunks selecionados, mesmo com muitos candidatos fortes. Com
+# expansão de query ligada, alguns golds aparecem em rank 11-14
+# (fu-kv-medidas, bip-rpl-extremos) — um teto de 12 os perderia; 16 cobre
+# com folga sem voltar à inundação de 40.
+CONTEXT_MAX_CHUNKS = int(os.getenv("CONTEXT_MAX_CHUNKS", "16"))
+
+# Orçamento de caracteres do contexto final, nunca cortando abaixo de
+# CONTEXT_MIN_CHUNKS. ~22000 chars ≈ 5.5k tokens — vs. o pior caso medido
+# do regime antigo (~80k chars/20k tokens com companions), um corte de
+# ~3.6x no tamanho de entrada por pergunta.
+CONTEXT_CHAR_BUDGET = int(os.getenv("CONTEXT_CHAR_BUDGET", "22000"))
+
+# Margem relativa ao melhor score que define a "janela natural" de chunks
+# fortemente relacionados ao top-1 — controla a FORMA da seleção, não a
+# contagem (isso é papel de MIN/MAX). Spread observado do melhor candidato
+# até o rank 40 é 0.15-0.29; 0.08 tipicamente resulta em 5-15 chunks antes
+# do preenchimento mínimo/teto entrarem em ação.
+CONTEXT_RELATIVE_MARGIN = float(os.getenv("CONTEXT_RELATIVE_MARGIN", "0.08"))
+
+# Piso absoluto de similaridade para entrar na janela relativa, independente
+# de quão longe o top-1 estiver. Mínimos observados no rank 40 variam
+# 0.343-0.471; 0.45 fica abaixo do top-1 respondível mais fraco medido
+# (0.539), então nunca bloqueia o preenchimento mínimo.
+CONTEXT_ABSOLUTE_FLOOR = float(os.getenv("CONTEXT_ABSOLUTE_FLOOR", "0.45"))
+
+# Máximo de arquivos distintos citados numa resposta — uma resposta que cita
+# mais que isso está quase certamente citando companions/ruído, não fontes
+# genuinamente usadas.
+CITATION_MAX_FILES = int(os.getenv("CITATION_MAX_FILES", "3"))
+
+# ── Modelos separados: geração final vs. tarefas utilitárias ────────────────
+# Uma única instância de LLM atendia geração de resposta, expansão de query
+# e condensação de follow-up. Para Q&A científico com números/tabelas, a
+# geração é o gargalo de qualidade mais isolável — subir só ela captura a
+# maior parte do ganho a um custo incremental menor (1 chamada cara por
+# pergunta, vs. 2-3 chamadas utilitárias baratas que não precisam do mesmo
+# raciocínio).
+GENERATION_MODEL = os.getenv("GENERATION_MODEL", "gpt-4o")
+UTILITY_MODEL = os.getenv("UTILITY_MODEL", "gpt-4o-mini")
+
+# ── Data companions (restore-rag-answer-quality: limitado, não removido) ────
+# `_add_data_companion_chunks` continua sendo hoje a única fonte de tabelas
+# específicas (FIS, RPL) que a busca semântica não recupera bem — ver
+# design.md. Teto TOTAL (não por arquivo, que no pior caso injetava até 20
+# chunks de arquivos irrelevantes) e desligável para comparação com a busca
+# híbrida (change futura).
+DATA_COMPANION_ENABLED = os.getenv("DATA_COMPANION_ENABLED", "true").lower() == "true"
+DATA_COMPANION_MAX_TOTAL = int(os.getenv("DATA_COMPANION_MAX_TOTAL", "3"))
+
+# ── Busca híbrida léxica + vetorial (add-hybrid-lexical-vector-search) ──────
+# Default False até o rollout gradual (grupo 7 do change) confirmar ganho no
+# harness sem regressão de out_of_corpus_refusal_rate — ligar manualmente
+# via env para validar antes de mudar o default.
+HYBRID_SEARCH_ENABLED = os.getenv("HYBRID_SEARCH_ENABLED", "false").lower() == "true"
+
+# Constante do artigo original que introduziu Reciprocal Rank Fusion
+# (Cormack et al. 2009). Não calibrada contra dados deste corpus — 124
+# linhas não são amostra suficiente para ajustar um hiperparâmetro com
+# confiança; usar o valor padrão da literatura é mais defensável que fingir
+# uma calibração que os dados não sustentam.
+RRF_K = int(os.getenv("RRF_K", "60"))
+
+# Um termo da pergunta só conta como "discriminativo" (sinal de cobertura
+# léxica para o gate de recusa) se aparece em até esta fração dos chunks do
+# corpus — acima disso é vocabulário genérico do domínio (ex. "tilápia",
+# "tratamento") que casa com quase tudo e não ajuda a distinguir uma
+# pergunta dentro do escopo de uma fora. Medido: "tilapia" aparece em 64.5%
+# dos chunks (80/124), "rpl" em 1.6% (2/124) — 20% separa claramente os dois.
+LEXICAL_DISCRIMINATIVE_MAX_DOC_FREQ = float(
+    os.getenv("LEXICAL_DISCRIMINATIVE_MAX_DOC_FREQ", "0.20")
+)
+
 
 def effective_config_summary() -> str:
     return (
@@ -55,5 +139,12 @@ def effective_config_summary() -> str:
         f"embedding_dimensions={EMBEDDING_DIMENSIONS} "
         f"chunk_size={CHUNK_SIZE} chunk_overlap={CHUNK_OVERLAP} "
         f"retrieval_k={RETRIEVAL_K} retrieval_k_retry={RETRIEVAL_K_RETRY} "
-        f"refusal_floor_similarity={REFUSAL_FLOOR_SIMILARITY}"
+        f"refusal_floor_similarity={REFUSAL_FLOOR_SIMILARITY} "
+        f"context_min_chunks={CONTEXT_MIN_CHUNKS} context_max_chunks={CONTEXT_MAX_CHUNKS} "
+        f"context_char_budget={CONTEXT_CHAR_BUDGET} "
+        f"generation_model={GENERATION_MODEL} utility_model={UTILITY_MODEL} "
+        f"data_companion_enabled={DATA_COMPANION_ENABLED} "
+        f"data_companion_max_total={DATA_COMPANION_MAX_TOTAL} "
+        f"hybrid_search_enabled={HYBRID_SEARCH_ENABLED} rrf_k={RRF_K} "
+        f"lexical_discriminative_max_doc_freq={LEXICAL_DISCRIMINATIVE_MAX_DOC_FREQ}"
     )

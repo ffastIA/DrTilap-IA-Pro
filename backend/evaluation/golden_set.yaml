@@ -22,7 +22,13 @@
 #   expected_passages    trechos literais que a recuperação deve trazer
 #   must_mention         pontos que a resposta precisa conter
 
-version: 1
+version: 2
+# v2 (fix-rag-eval-harness-fidelity): adicionadas 7 perguntas fora do escopo
+# "adversariais" — que reusam vocabulário/entidades/métricas do corpus mas
+# pedem algo que não está nele. As 4 perguntas out_of_corpus originais são
+# lexicalmente distantes do corpus e não testam de verdade a capacidade de
+# recusa: o sistema pode acertar por sorte léxica, não por entender que não
+# sabe. Nenhuma entrada de v1 foi alterada ou removida — diff puramente aditivo.
 corpus_files_covered:
   - "Genetic and phenotypic characterization of Nile tilapia.pdf"
   - "BIA_RAG.pdf"
@@ -291,6 +297,82 @@ questions:
     expected_source_file: null
     expected_passages: []
     must_mention: []
+
+  # ------------------------------------------------------- fora do escopo (adversariais)
+  # As 4 acima são lexicalmente distantes do corpus — o sistema pode recusar
+  # por sorte, não por entender que não sabe. Estas reusam vocabulário,
+  # métricas ou entidades reais do corpus, trocando só o elemento que torna
+  # a pergunta irrespondível. O sistema DEVE recusar todas.
+  - id: oos-dieta-restritiva
+    question: "Como se comporta a tilápia do nilo com dieta restritiva?"
+    scope: out_of_corpus
+    question_type: conceptual
+    expected_source_file: null
+    expected_passages: []
+    must_mention: []
+    # A falha observada ao vivo nesta investigação: o sistema não recusou,
+    # respondeu com um esqueleto de seções vazias e citou os 4 documentos
+    # da base com quase todo o intervalo de páginas.
+
+  - id: oos-fis-carpa
+    question: "Qual o coeficiente de endogamia FIS das populações de carpa capim no banco de germoplasma?"
+    scope: out_of_corpus
+    question_type: quantitative
+    expected_source_file: null
+    expected_passages: []
+    must_mention: []
+    # Troca de entidade mantendo vocabulário técnico idêntico ao do corpus
+    # (FIS, endogamia, banco de germoplasma, populações) — o corpus fala de
+    # tilápia do Nilo, não carpa capim. Alta similaridade de cosseno esperada.
+
+  - id: oos-rpl-streptococcus
+    question: "Qual o RPL dos tratamentos contra Streptococcus agalactiae no estudo do BIP 2024?"
+    scope: out_of_corpus
+    question_type: quantitative
+    expected_source_file: null
+    expected_passages: []
+    must_mention: []
+    # Estudo real, métrica real (RPL), mas o patógeno do desafio experimental
+    # no BIP 2024 é Aeromonas hydrophila, não Streptococcus agalactiae.
+
+  - id: oos-roi-2030
+    question: "Qual o ROI projetado do BIA para o ano de 2030?"
+    scope: out_of_corpus
+    question_type: quantitative
+    expected_source_file: null
+    expected_passages: []
+    must_mention: []
+    # Entidade e métrica do corpus (BIA, ROI), mas o horizonte projetado no
+    # documento é por semestre do MVP, não um valor específico para 2030.
+
+  - id: oos-kv-tambaqui
+    question: "Qual o KV médio de tambaqui no momento do abate?"
+    scope: out_of_corpus
+    question_type: quantitative
+    expected_source_file: null
+    expected_passages: []
+    must_mention: []
+    # Índice do corpus (KV), espécie fora do corpus (o documento trata só
+    # de tilápia).
+
+  - id: oos-densidade-estocagem
+    question: "Qual a densidade de estocagem recomendada para tilápia em tanque-rede?"
+    scope: out_of_corpus
+    question_type: methodological
+    expected_source_file: null
+    expected_passages: []
+    must_mention: []
+    # Pergunta plausível de domínio, genuinamente ausente do corpus.
+
+  - id: oos-temperatura-otima
+    question: "Qual a faixa de temperatura ótima para o crescimento da tilápia do Nilo?"
+    scope: out_of_corpus
+    question_type: quantitative
+    expected_source_file: null
+    expected_passages: []
+    must_mention: []
+    # Mesmo padrão — plausível, ausente do corpus, mas pode pontuar em zona
+    # intermediária de similaridade por reusar "tilápia do Nilo"/"crescimento".
 
   # ---------------------------------------------------------------- follow-ups
   # A última pergunta é incompleta sem o histórico. Mede condensação de consulta.

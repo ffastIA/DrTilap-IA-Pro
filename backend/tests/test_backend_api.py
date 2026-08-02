@@ -293,11 +293,26 @@ def test_delete_vector_file_success(client, monkeypatch):
 
 
 def test_cleanup_vector_base_success(client, monkeypatch):
-    """Testa limpeza da base vetorial bem-sucedida."""
+    """Testa limpeza da base vetorial bem-sucedida.
+
+    CUIDADO: o endpoint `/admin/vector-base/cleanup` chama
+    `vector_admin_service.cleanup(...)`, não `cleanup_vector_base(...)` —
+    mockar o nome errado (como esta função fazia antes) NÃO gera erro,
+    porque `cleanup_vector_base` também existe como método real (chama
+    `cleanup` internamente) — só não é o método que o endpoint de fato usa.
+    O resultado: o mock nunca interceptava a chamada real, e este teste
+    disparava uma limpeza VERDADEIRA contra o Supabase de produção toda vez
+    que a suíte completa rodava. Foi assim que a base vetorial do RAG foi
+    esvaziada repetidamente durante o desenvolvimento de
+    `add-hybrid-lexical-vector-search` — descoberto inspecionando os logs
+    de API do Supabase (padrão de GET+DELETE em lote repetido a cada
+    execução de `pytest tests/`). Mockar sempre `cleanup`, o método que
+    `app/main.py` realmente chama.
+    """
     override_admin_user()
-    def mock_cleanup_vector_base(confirmation_phrase):
+    def mock_cleanup(confirmation_phrase):
         return build_cleanup_vector_base_response()
-    monkeypatch.setattr(main_module.vector_admin_service, "cleanup_vector_base", mock_cleanup_vector_base)
+    monkeypatch.setattr(main_module.vector_admin_service, "cleanup", mock_cleanup)
     payload = {"confirmation_phrase": "CONFIRMAR_LIMPEZA_TOTAL"}
     response = client.post("/admin/vector-base/cleanup", json=payload)
     assert response.status_code == 200

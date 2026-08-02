@@ -7,18 +7,17 @@ igualdade exata produziria falsos negativos sistemáticos.
 from __future__ import annotations
 
 import re
-import unicodedata
 from typing import Sequence
 
-
-def normalize(text: str) -> str:
-    """Normaliza texto para comparação tolerante a ruído de extração de PDF."""
-    text = unicodedata.normalize("NFKC", text or "")
-    text = text.replace("“", '"').replace("”", '"')
-    text = text.replace("‘", "'").replace("’", "'")
-    text = text.replace("–", "-").replace("—", "-")
-    text = re.sub(r"\s+", " ", text)
-    return text.strip().lower()
+# Reexportados para os consumidores deste módulo (`run_eval.py`, testes) —
+# implementação canônica em `app/utils/answer_quality.py`, usada também pela
+# produção (`RAGService.evaluate`/`verify_numeric`), para produção e medição
+# nunca divergirem silenciosamente sobre o que conta como "resposta vazia"
+# ou sobre normalização de decimais/sobrescritos.
+from app.utils.answer_quality import (  # noqa: F401
+    looks_like_empty_skeleton,
+    normalize_text as normalize,
+)
 
 
 def passage_rank(passage: str, retrieved_contents: Sequence[str]) -> int | None:
@@ -36,46 +35,28 @@ def passage_rank(passage: str, retrieved_contents: Sequence[str]) -> int | None:
 
 
 def is_refusal(answer: str) -> bool:
-    """Heurística para detectar recusa honesta.
+    """Detecta recusa por casamento contra as mensagens de recusa reais do
+    sistema (`RAGService._build_refusal_message`), não por corte de tamanho.
 
-    Deliberadamente conservadora: só considera recusa quando a resposta é curta
-    OU contém um marcador explícito de ausência de informação. Uma resposta longa
-    e substantiva que apenas menciona 'não foi possível' em uma seção NÃO conta
-    como recusa — é exatamente o comportamento que queremos medir como falha.
+    A versão anterior classificava por `len < 400 and marcador` ou `len <
+    120` — acoplada ao formato da resposta. Um template de resposta mais
+    longo (mesmo sendo substancialmente uma recusa) escapava do primeiro
+    corte, e uma resposta curta e substantiva sem nenhum marcador de recusa
+    caía no segundo corte só por ser curta. Casar contra a mensagem real
+    elimina os dois falsos negativos/positivos ao preço de precisar chamar
+    `get_rag_service()` — import local para não pesar o import deste módulo
+    quando só a normalização/cobertura de menção são necessárias.
     """
     normalized = normalize(answer)
     if not normalized:
         return True
 
-    markers = (
-        "não há informação",
-        "nao ha informacao",
-        "não encontrei",
-        "nao encontrei",
-        "não consta",
-        "nao consta",
-        "não está disponível no contexto",
-        "nao esta disponivel no contexto",
-        "não posso responder",
-        "nao posso responder",
-        "contexto não cobre",
-        "contexto nao cobre",
-        "base de conhecimento não",
-        "base de conhecimento nao",
-        "fora do escopo",
-        "não foi possível encontrar",
-        "nao foi possivel encontrar",
-        "i don't have",
-        "not available in the context",
-    )
-    has_marker = any(marker in normalized for marker in markers)
+    from app.services.rag_service import get_rag_service
 
-    # Resposta curta com marcador, ou muito curta: recusa.
-    if len(normalized) < 400 and has_marker:
-        return True
-    if len(normalized) < 120:
-        return True
-    return False
+    service = get_rag_service()
+    refusal_pt = normalize(service._build_refusal_message("pt-BR"))
+    refusal_en = normalize(service._build_refusal_message("en"))
+    return refusal_pt in normalized or refusal_en in normalized
 
 
 def mention_coverage(answer: str, must_mention: Sequence[str]) -> float:
