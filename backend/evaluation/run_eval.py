@@ -32,6 +32,10 @@ from evaluation.metrics import (  # noqa: E402
     mention_coverage,
     passage_rank,
 )
+from app.utils.rag_config import (  # noqa: E402
+    MULTI_QUERY_EXPANSION_ENABLED,
+    MULTI_QUERY_VARIANT_COUNT,
+)
 
 # Abaixo disso, `selected_count` (via `retrieve_for_eval`) é considerado
 # fome de contexto — medido: hoje a distribuição real nunca cai entre 7 e
@@ -89,6 +93,12 @@ def capture_config(service: Any, k: int, use_llm_expansion: bool) -> dict:
         "llm_model": getattr(service.llm_generation, "model_name", None),
         "retrieval_k": k,
         "use_llm_expansion": use_llm_expansion,
+        # add-multi-query-retrieval-expansion: lido do config efetivo, não do
+        # que este run presume — a flag pode ter sido setada via env var sem
+        # o harness saber, e um run salvo precisa registrar o que realmente
+        # rodou para ser comparável depois.
+        "multi_query_expansion_enabled": MULTI_QUERY_EXPANSION_ENABLED,
+        "multi_query_variant_count": MULTI_QUERY_VARIANT_COUNT if MULTI_QUERY_EXPANSION_ENABLED else None,
     }
 
 
@@ -290,12 +300,19 @@ def build_usefulness_judge(service: Any):
 def estimate_embedding_calls(question_count: int, use_llm_expansion: bool, full: bool) -> int:
     """Estimativa de chamadas de embedding, que o callback do LangChain não cobre.
 
-    Uma por recuperação. No modo completo há a recuperação da avaliação, mais a
-    de dentro do `get_answer` (com possíveis retries) e a do juiz.
+    Uma por recuperação — exceto quando `MULTI_QUERY_EXPANSION_ENABLED`, caso
+    em que cada recuperação embute `MULTI_QUERY_VARIANT_COUNT` variantes em
+    vez de uma só (add-multi-query-retrieval-expansion). No modo completo há
+    a recuperação da avaliação, mais a de dentro do `get_answer` (com
+    possíveis retries — não contados) e a do juiz.
     """
-    per_question = 1
+    variants_per_retrieval = (
+        MULTI_QUERY_VARIANT_COUNT if (MULTI_QUERY_EXPANSION_ENABLED and use_llm_expansion) else 1
+    )
+    per_question = variants_per_retrieval  # recuperação da avaliação
     if full:
-        per_question += 2  # get_answer + juiz (sem contar retries)
+        per_question += variants_per_retrieval  # recuperação dentro de get_answer
+        per_question += 1  # juiz (chamada avulsa, não escala com variantes)
     return question_count * per_question
 
 
@@ -344,6 +361,32 @@ def summarize(results: list[dict]) -> dict:
             if len(context_chars_list) >= 20
             else max(context_chars_list)
         )
+
+    # Recorte por prefixo `col-` (add-multi-query-retrieval-expansion) —
+    # perguntas coloquiais/imprecisas, irmãs de perguntas `in_corpus`
+    # existentes. Reportado à parte porque é exatamente a categoria que esta
+    # change tenta melhorar; misturado na média geral (`mean_recall`) o
+    # efeito ficaria diluído por 35+ perguntas que já tinham fraseado exato.
+    col_results = [r for r in results if r["id"].startswith("col-")]
+    if col_results:
+        col_recalls = [r["retrieval"]["recall"] for r in col_results
+                       if r.get("retrieval") and r["retrieval"]["recall"] is not None]
+        col_top_sims = [r["retrieval"]["top_similarity"] for r in col_results if r.get("retrieval")]
+        col_selected = [r["retrieval"]["selected_count"] for r in col_results
+                        if r.get("retrieval") and r["retrieval"].get("selected_count") is not None]
+        summary["col_questions_total"] = len(col_results)
+        summary["col_mean_recall"] = round(statistics.mean(col_recalls), 3) if col_recalls else None
+        summary["col_perfect_recall_rate"] = (
+            round(sum(1 for r in col_recalls if r == 1.0) / len(col_recalls), 3)
+            if col_recalls else None
+        )
+        summary["col_mean_top_similarity"] = (
+            round(statistics.mean(col_top_sims), 3) if col_top_sims else None
+        )
+        if col_selected:
+            summary["col_starvation_rate"] = round(
+                sum(1 for c in col_selected if c <= STARVATION_CHUNK_THRESHOLD) / len(col_selected), 3
+            )
 
     generated = [r for r in results if r.get("generation")]
     if generated:

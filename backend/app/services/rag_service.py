@@ -55,6 +55,7 @@ from app.utils.rag_config import (
     GENERATION_MODEL, UTILITY_MODEL,
     DATA_COMPANION_ENABLED, DATA_COMPANION_MAX_TOTAL,
     HYBRID_SEARCH_ENABLED, RRF_K, LEXICAL_DISCRIMINATIVE_MAX_DOC_FREQ,
+    MULTI_QUERY_EXPANSION_ENABLED, MULTI_QUERY_VARIANT_COUNT,
 )
 
 
@@ -1598,6 +1599,85 @@ class RAGService:
             logger.warning("[expand_query] falha LLM (%s) — usando reescrita local", exc)
         return self._rewrite_query(question, lang)
 
+    def _generate_technical_paraphrase(self, question: str, lang: str) -> Optional[str]:
+        """Reescreve a pergunta no registro técnico/científico do corpus,
+        numa chamada LLM dedicada (mesmo padrão de chamada única e foco
+        estreito de `_expand_query_with_llm`/`_condense_followup_question`).
+
+        Retorna `None` em caso de falha/resposta inválida — o chamador
+        decide o fallback (`_expand_query_multi_variant` simplesmente não
+        inclui essa variante, sem quebrar as outras).
+        """
+        try:
+            prompt = (
+                "You are a domain expert in tilapia and other fish/crustacean "
+                "aquaculture science.\n\n"
+                f"Question (possibly phrased informally): {question}\n"
+                f"Language: {lang}\n\n"
+                "Reword this question the way it would be phrased in a "
+                "scientific paper on the subject, using precise technical "
+                "terminology instead of colloquial wording. Do NOT add facts "
+                "that are not in the original question. Do NOT answer the "
+                "question — only reword it. Return ONLY the reworded "
+                "question, no explanations, no quotes."
+            )
+            response = self.llm_utility.invoke([HumanMessage(content=prompt)])
+            paraphrase = response.content.strip().strip('"')
+            if paraphrase and len(paraphrase) >= 5:
+                return paraphrase
+            logger.warning("[technical_paraphrase] resposta LLM inválida")
+        except Exception as exc:
+            logger.warning("[technical_paraphrase] falha LLM (%s)", exc)
+        return None
+
+    def _expand_query_multi_variant(self, question: str, lang: str) -> List[str]:
+        """Gera múltiplas formulações da pergunta para busca vetorial em leque
+        (multi-query fan-out).
+
+        Ataca o caso em que o usuário não conhece a terminologia exata dos
+        documentos: uma única string embutida (pergunta + sinônimos
+        apendados, como em `_expand_query_with_llm`) pode não cruzar o piso
+        de recusa por cosseno mesmo quando a pergunta é genuinamente
+        respondível. Buscar com várias formulações dá mais chances de uma
+        delas casar com o registro em que o corpus foi escrito — a fusão por
+        MÁXIMO de similaridade entre variantes (`_retrieve_docs_via_rpc`)
+        preserva a calibração existente do piso, só aumenta as chances de
+        cruzá-lo com a formulação certa.
+
+        Reaproveita `_expand_query_with_llm` (chamada dedicada, já validada
+        em produção) em vez de pedir a mesma expansão numa única chamada
+        combinada com a paráfrase. Medido na validação desta change: uma
+        chamada só pedindo 3 saídas de uma vez (original/sinônimos/paráfrase)
+        gera uma lista de sinônimos com mais variância/qualidade inferior à
+        chamada dedicada — ao ponto de o MÁXIMO entre as variantes separadas
+        ficar ABAIXO do que a chamada única de hoje já alcançava sozinha
+        (caso `col-gen-fis-extremos`, ver tasks.md). Duas chamadas utilitárias
+        (baratas, gpt-4o-mini) em vez de uma garantem que este método nunca
+        fica pior que `_expand_query_with_llm` sozinho — só adiciona chance,
+        nunca subtrai.
+
+        Retorna sempre a pergunta original como 1ª variante. Se a paráfrase
+        falhar, a lista ainda tem 2 variantes (original + expansão por
+        sinônimos) — nunca cai abaixo do comportamento de query única.
+        """
+        variants = [question, self._expand_query_with_llm(question, lang)]
+        paraphrase = self._generate_technical_paraphrase(question, lang)
+        if paraphrase:
+            variants.append(paraphrase)
+
+        deduped: List[str] = []
+        seen = set()
+        for v in variants:
+            key = v.strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(v)
+
+        logger.info(
+            "[expand_query_multi] '%s...' → %d variantes", question[:40], len(deduped)
+        )
+        return deduped[:MULTI_QUERY_VARIANT_COUNT] or [question]
+
     def _condense_followup_question(
         self, question: str, history: List[List[str]], lang: str
     ) -> str:
@@ -1948,24 +2028,50 @@ class RAGService:
                                Usado pelo harness de avaliação; produção não precisa passar isso.
         """
         lang = self._detect_question_language(question)
-        if use_llm_expansion:
-            rewritten_question = self._expand_query_with_llm(question, lang)
+        query_variants: List[str] = []
+
+        if use_llm_expansion and MULTI_QUERY_EXPANSION_ENABLED:
+            # Fan-out multi-query (add-multi-query-retrieval-expansion): busca
+            # com várias formulações da pergunta em vez de uma só, fundindo
+            # os candidatos por MÁXIMO de cosseno por chunk (não RRF — todas
+            # as buscas vivem no mesmo espaço vetorial, então isso preserva
+            # a calibração existente do piso de recusa sem recalibrar nada).
+            query_variants = self._expand_query_multi_variant(question, lang)
+            rewritten_question = " ".join(query_variants)
+            seen: Dict[str, Document] = {}
+            for variant in query_variants:
+                variant_vector = self._embed_query(variant)
+                variant_matches = self._search_rpc(variant_vector, k)
+                for m in variant_matches:
+                    doc = self._normalize_match_doc(m)
+                    key = self._make_retrieval_dedup_key(doc)
+                    current_sim = doc.metadata.get("similarity", 0)
+                    if key not in seen or current_sim > seen[key].metadata.get("similarity", 0):
+                        seen[key] = doc
+            vector_docs = sorted(
+                seen.values(),
+                key=lambda d: d.metadata.get("similarity", 0),
+                reverse=True,
+            )
         else:
-            rewritten_question = self._rewrite_query(question, lang)
-        query_vector = self._embed_query(rewritten_question)
-        matches = self._search_rpc(query_vector, k)
-        docs = [self._normalize_match_doc(m) for m in matches]
-        seen: Dict[str, Document] = {}
-        for doc in docs:
-            key = self._make_retrieval_dedup_key(doc)
-            current_sim = doc.metadata.get("similarity", 0)
-            if key not in seen or current_sim > seen[key].metadata.get("similarity", 0):
-                seen[key] = doc
-        vector_docs = sorted(
-            seen.values(),
-            key=lambda d: d.metadata.get("similarity", 0),
-            reverse=True,
-        )
+            if use_llm_expansion:
+                rewritten_question = self._expand_query_with_llm(question, lang)
+            else:
+                rewritten_question = self._rewrite_query(question, lang)
+            query_vector = self._embed_query(rewritten_question)
+            matches = self._search_rpc(query_vector, k)
+            docs = [self._normalize_match_doc(m) for m in matches]
+            seen = {}
+            for doc in docs:
+                key = self._make_retrieval_dedup_key(doc)
+                current_sim = doc.metadata.get("similarity", 0)
+                if key not in seen or current_sim > seen[key].metadata.get("similarity", 0):
+                    seen[key] = doc
+            vector_docs = sorted(
+                seen.values(),
+                key=lambda d: d.metadata.get("similarity", 0),
+                reverse=True,
+            )
 
         # Capturado ANTES do gate e ANTES da fusão híbrida — a decisão de
         # recusa e esta métrica de observabilidade usam sempre o cosseno
@@ -2032,6 +2138,8 @@ class RAGService:
                 "selected_count": len(selected),
                 "context_chars": sum(len(d.page_content) for d in selected),
                 "selection_reason": selection_reason,
+                "multi_query_enabled": MULTI_QUERY_EXPANSION_ENABLED,
+                "query_variants": query_variants,
             })
 
         return selected

@@ -1,11 +1,15 @@
 # CAMINHO: backend/app/dependencies.py
 # ARQUIVO: dependencies.py
 
+import logging
+
 from app.database import supabase
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from supabase_auth.errors import AuthApiError
 from typing import Any
 
+logger = logging.getLogger(__name__)
 security = HTTPBearer(auto_error=False)
 
 
@@ -47,8 +51,21 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials | None = De
     except HTTPException:
         # Repropagar exceções HTTP
         raise
+    except AuthApiError as e:
+        # Token expirado/revogado/malformado: o Supabase rejeita a chamada
+        # `auth.get_user` levantando `AuthApiError` (ex.: 403 Forbidden) em
+        # vez de devolver uma resposta com `user=None` — sem este catch,
+        # caía no `except Exception` genérico abaixo e virava 500, mascarando
+        # um problema de autenticação (sessão expirada) como erro de servidor.
+        logger.warning(
+            "[get_current_user] AuthApiError: code=%s status=%s",
+            getattr(e, "code", None), getattr(e, "status", None),
+        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token inválido ou expirado")
     except Exception as e:
-        # Para erros inesperados, retornar 500
+        # Para erros genuinamente inesperados, retornar 500 — mas logar,
+        # senão a causa raiz fica invisível para sempre.
+        logger.exception("[get_current_user] erro inesperado ao validar token")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Erro interno do servidor")
 
 

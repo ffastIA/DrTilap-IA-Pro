@@ -3,7 +3,7 @@
 import logging
 from typing import Optional, Dict, Any
 import httpx
-from gotrue.errors import AuthApiError
+from supabase_auth.errors import AuthApiError
 from supabase import create_client, Client, ClientOptions
 from app.database import (
     SUPABASE_URL,

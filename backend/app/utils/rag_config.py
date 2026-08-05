@@ -132,6 +132,21 @@ LEXICAL_DISCRIMINATIVE_MAX_DOC_FREQ = float(
     os.getenv("LEXICAL_DISCRIMINATIVE_MAX_DOC_FREQ", "0.20")
 )
 
+# ── Expansão de query multi-variante (add-multi-query-retrieval-expansion) ──
+# Default False até o harness confirmar ganho de recall em perguntas
+# coloquiais/imprecisas sem regressão de out_of_corpus_refusal_rate — mesmo
+# padrão de rollout gradual de HYBRID_SEARCH_ENABLED. Ao contrário da busca
+# híbrida, a fusão aqui é por MÁXIMO de cosseno entre variantes (mesmo
+# espaço vetorial em todas), não RRF — preserva a calibração existente de
+# REFUSAL_FLOOR_SIMILARITY/CONTEXT_*, nada precisa ser recalibrado.
+MULTI_QUERY_EXPANSION_ENABLED = os.getenv("MULTI_QUERY_EXPANSION_ENABLED", "false").lower() == "true"
+
+# Número de variantes de query geradas por uma única chamada LLM (original +
+# expansão por sinônimos existente + paráfrase em registro técnico). Fixo
+# como ponto de partida — env-configurável como RETRIEVAL_K caso o harness
+# mostre que outro valor é melhor.
+MULTI_QUERY_VARIANT_COUNT = int(os.getenv("MULTI_QUERY_VARIANT_COUNT", "3"))
+
 
 def effective_config_summary() -> str:
     return (
@@ -146,5 +161,7 @@ def effective_config_summary() -> str:
         f"data_companion_enabled={DATA_COMPANION_ENABLED} "
         f"data_companion_max_total={DATA_COMPANION_MAX_TOTAL} "
         f"hybrid_search_enabled={HYBRID_SEARCH_ENABLED} rrf_k={RRF_K} "
-        f"lexical_discriminative_max_doc_freq={LEXICAL_DISCRIMINATIVE_MAX_DOC_FREQ}"
+        f"lexical_discriminative_max_doc_freq={LEXICAL_DISCRIMINATIVE_MAX_DOC_FREQ} "
+        f"multi_query_expansion_enabled={MULTI_QUERY_EXPANSION_ENABLED} "
+        f"multi_query_variant_count={MULTI_QUERY_VARIANT_COUNT}"
     )
