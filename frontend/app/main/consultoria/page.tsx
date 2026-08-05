@@ -3,12 +3,13 @@
 'use client';
 
 import React, { useState, useRef, useEffect } from 'react';
-import { useRouter } from 'next/navigation';
 import { useChat, ChatSource } from '@/hooks/useChat';
 import ChatMessage from '@/components/ChatMessage';
 import LoadingSpinner from '@/components/LoadingSpinner';
 import Button from '@/components/Button';
-import { SendIcon, Trash2Icon, ArrowLeftIcon, MessageSquareTextIcon } from 'lucide-react';
+import PageHeader from '@/components/ui/PageHeader';
+import BackButton from '@/components/ui/BackButton';
+import { SendIcon, Trash2Icon, MessageSquareTextIcon } from 'lucide-react';
 
 interface Message {
   id: string;
@@ -18,8 +19,6 @@ interface Message {
 }
 
 export default function Consultoria() {
-  const router = useRouter();
-
   const { messages, isLoading, error, sendMessage, clearChat } = useChat() as {
     messages: Message[];
     isLoading: boolean;
@@ -39,14 +38,6 @@ export default function Consultoria() {
     scrollToBottom();
   }, [messages]);
 
-  const handleBack = () => {
-    if (window.history.length > 1) {
-      router.back();
-    } else {
-      router.push('/main/hub');
-    }
-  };
-
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (input.trim() && !isLoading) {
@@ -61,39 +52,26 @@ export default function Consultoria() {
   };
 
   return (
-    <div className="flex flex-col h-screen bg-background">
-      <header className="p-4 border-b border-border bg-card shadow-sm">
-        <div className="flex items-center gap-4 max-w-4xl mx-auto">
-          <Button
-            variant="secondary"
-            onClick={handleBack}
-            className="flex items-center gap-2 p-2 h-auto"
-            size="sm"
-          >
-            <ArrowLeftIcon className="w-4 h-4" />
-            Voltar
-          </Button>
-          <div>
-            <h1 className="text-2xl font-bold text-foreground">Consultoria de IA</h1>
-            <p className="text-muted-foreground text-sm mt-1">
-              Faça perguntas sobre piscicultura e tilápias
-            </p>
-          </div>
-        </div>
-      </header>
+    <div className="flex flex-col">
+      <PageHeader
+        kicker="Assistente de IA"
+        title="Consultoria de IA"
+        description="Faça perguntas sobre piscicultura e tilápias"
+        actions={<BackButton />}
+      />
 
-      <main className="flex-1 flex flex-col overflow-hidden max-w-4xl mx-auto w-full">
-        <div className="flex-1 overflow-y-auto p-6 space-y-6 pb-20">
+      <div className="border border-border bg-card flex flex-col">
+        <div className="max-h-[55vh] overflow-y-auto p-6 space-y-6">
           {error && (
-            <div className="p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
+            <div className="p-4 bg-destructive/10 border border-destructive/30 text-destructive text-sm">
               Erro: {error}
             </div>
           )}
 
           {messages.length === 0 && !isLoading ? (
-            <div className="flex flex-col items-center justify-center h-full text-center py-20">
-              <MessageSquareTextIcon className="w-20 h-20 text-muted-foreground mb-6 opacity-60" />
-              <h2 className="text-2xl font-semibold text-foreground mb-3">
+            <div className="flex flex-col items-center justify-center text-center py-16">
+              <MessageSquareTextIcon className="w-16 h-16 text-muted-foreground mb-6 opacity-60" />
+              <h2 className="font-heading font-semibold text-xl uppercase mb-3">
                 Bem-vindo à Consultoria de IA
               </h2>
               <p className="text-muted-foreground max-w-md leading-relaxed">
@@ -120,14 +98,14 @@ export default function Consultoria() {
           <div ref={messagesEndRef} />
         </div>
 
-        <form onSubmit={handleSubmit} className="p-6 border-t border-border bg-card shrink-0">
-          <div className="flex gap-3 max-w-4xl mx-auto w-full">
+        <form onSubmit={handleSubmit} className="p-4 border-t border-border">
+          <div className="flex gap-3">
             <input
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
               placeholder="Digite sua pergunta sobre tilápias..."
-              className="flex-1 px-4 py-3 border border-border rounded-xl focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent transition-all bg-background text-foreground placeholder:text-muted-foreground"
+              className="flex-1 px-4 py-3 border border-border bg-surface text-foreground placeholder:text-muted-foreground focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring"
               disabled={isLoading}
             />
             <Button
@@ -150,7 +128,7 @@ export default function Consultoria() {
             </Button>
           </div>
         </form>
-      </main>
+      </div>
     </div>
   );
 }

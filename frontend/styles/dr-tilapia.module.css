@@ -1,25 +1,27 @@
 /*
   Design system extracted from the "Dr. Tilap-IA - Landing (Standalone)" mockup.
-  Scoped via CSS Modules so it never leaks into /main/* (dark theme, Poppins)
-  or collides with the global styles/globals.css tokens.
+  The color/typography values now live in :root (styles/globals.css, sourced from
+  frontend/lib/tokens.ts) and are shared by the whole app — this block only maps
+  those globals onto the local names used throughout this file, plus the landing's
+  own rhythm/spacing scale, which has no app-wide equivalent.
 */
 
 .theme {
-  --color-bg: #f2f2f3;
-  --color-surface: #e9e9ea;
-  --color-text: #1d1f20;
-  --color-accent: #5980a6;
+  --color-bg: var(--color-background);
+  /* --color-surface: same name as the :root global — inherited as-is. */
+  --color-text: var(--color-foreground);
+  --color-accent: var(--color-primary);
   --color-accent-2: #728fab;
-  --color-divider: color-mix(in srgb, #1d1f20 16%, transparent);
+  --color-divider: var(--color-border);
 
   --color-neutral-100: #f5f5f8;
   --color-neutral-200: #e7e7ea;
   --color-neutral-300: #d4d4d7;
   --color-neutral-900: #2b2b2d;
 
-  --color-accent-100: #eef6ff;
-  --color-accent-600: #597ea3;
-  --color-accent-700: #416180;
+  --color-accent-100: var(--color-primary-soft);
+  --color-accent-600: var(--color-primary-hover);
+  --color-accent-700: var(--color-primary-active);
   --color-accent-800: #2c455d;
 
   --font-heading: var(--font-barlow-condensed), system-ui, sans-serif;
@@ -40,10 +42,10 @@
   --edge: clamp(20px, 5vw, 72px);
   --measure: 60ch;
 
-  --color-error: #a13f3a;
-  --color-error-bg: #f6e9e8;
-  --color-success: #3f6b4a;
-  --color-success-bg: #e9f1eb;
+  --color-error: var(--color-destructive);
+  --color-error-bg: var(--color-destructive-bg);
+  /* --color-success / --color-success-bg: same name as the :root globals,
+     inherited as-is — redeclaring here would be a self-reference. */
 
   background: var(--color-bg);
   color: var(--color-text);

@@ -32,7 +32,7 @@ function getFirstDefined<T>(...values: Array<T | null | undefined | ''>): T | un
 
 function toDateOrNull(value: unknown): Date | null {
   if (!value) return null;
-  const date = new Date(value);
+  const date = new Date(value as string | number | Date);
   return isNaN(date.getTime()) ? null : date;
 }
 
@@ -193,12 +193,14 @@ export async function uploadRagDocuments(
 export async function deleteRagDocument(
   payload: RagDeletePayload | { id?: string; ids?: string[]; delete_chunks?: boolean; [key: string]: unknown }
 ): Promise<RagDeleteResponse> {
+  const loosePayload = payload as { id?: string; ids?: string[] };
+
   let ids: string[] = [];
-  if (Array.isArray(payload.ids)) {
-    ids.push(...payload.ids);
+  if (Array.isArray(loosePayload.ids)) {
+    ids.push(...loosePayload.ids);
   }
-  if (payload.id) {
-    ids.push(payload.id);
+  if (loosePayload.id) {
+    ids.push(loosePayload.id);
   }
   ids = ids.filter((id) => !!id && id.trim().length > 0);
 
@@ -247,11 +249,11 @@ export async function clearRagDatabase(confirm?: boolean): Promise<RagClearRespo
 
   return {
     cleared,
-    count,
+    count: count ?? 0,
   };
 }
 
-export async function getRagOperationStatus(jobId: string): Promise<RagOperationStatusResponse> {
+export async function getRagOperationStatus(_jobId: string): Promise<RagOperationStatusResponse> {
   throw new Error('Status de operação não está disponível no backend atual.');
 }
 

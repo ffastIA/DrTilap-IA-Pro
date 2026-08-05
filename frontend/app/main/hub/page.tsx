@@ -5,6 +5,8 @@ import Link from 'next/link';
 import { MessageSquareTextIcon, UploadCloudIcon, BarChart2Icon, UserIcon, VideoIcon, ScanSearchIcon } from 'lucide-react';
 import { useAuthStore } from '@/store/authStore';
 import { useRouter } from 'next/navigation';
+import Card from '@/components/ui/Card';
+import CornerMarks from '@/components/ui/CornerMarks';
 
 const FeatureCard: React.FC<{
   icon: React.ElementType;
@@ -13,12 +15,13 @@ const FeatureCard: React.FC<{
   href: string;
   disabled?: boolean;
 }> = ({ icon: Icon, title, description, href, disabled }) => (
-  <Link href={href} className={`block ${disabled ? 'pointer-events-none opacity-50' : ''}`}>
-    <div className="glass-effect p-6 rounded-lg flex flex-col items-center text-center h-full transition-all duration-300 hover:scale-105 hover:shadow-xl">
-      <Icon size={48} className="text-primary mb-4" />
-      <h3 className="text-xl font-semibold text-white mb-2">{title}</h3>
-      <p className="text-text-secondary text-sm">{description}</p>
-    </div>
+  <Link href={href} className={`block h-full ${disabled ? 'pointer-events-none opacity-50' : ''}`}>
+    <Card corners className="flex flex-col items-center text-center h-full hover:bg-surface">
+      <CornerMarks />
+      <Icon size={40} className="text-primary mb-4" />
+      <h3 className="font-heading font-semibold text-lg uppercase mb-2">{title}</h3>
+      <p className="text-muted-foreground text-sm">{description}</p>
+    </Card>
   </Link>
 );
 
@@ -34,21 +37,21 @@ export default function HubPage() {
   };
 
   return (
-    <div className="min-h-screen bg-black p-8">
-      <div className="flex justify-start items-center mb-4">
+    <div>
+      <div className="flex justify-between items-start mb-8">
+        <div>
+          <h1 className="font-heading font-semibold text-3xl uppercase mb-2">Bem-vindo, {user?.email}!</h1>
+          <p className="text-muted-foreground">
+            Explore as funcionalidades do Dr. Tilápia, seu assistente de IA para piscicultura.
+          </p>
+        </div>
         <button
           onClick={handleLogout}
-          className="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded"
+          className="text-sm font-heading font-semibold uppercase text-destructive border border-destructive/35 px-4 py-2 hover:bg-destructive-bg"
         >
           Sair
         </button>
       </div>
-
-      <h1 className="text-4xl font-bold text-white mb-4">Bem-vindo, {user?.email}!</h1>
-
-      <p className="text-text-secondary text-lg mb-8">
-        Explore as funcionalidades do Dr. Tilápia, seu assistente de IA para piscicultura.
-      </p>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         <FeatureCard
@@ -105,10 +108,10 @@ export default function HubPage() {
       </div>
 
       <div className="mt-12">
-        <h2 className="text-3xl font-bold text-white mb-6">Atividades Recentes</h2>
-        <div className="glass-effect p-6 rounded-lg">
-          <p className="text-text-secondary">Nenhuma atividade recente para exibir.</p>
-        </div>
+        <h2 className="font-heading font-semibold text-xl uppercase mb-4">Atividades Recentes</h2>
+        <Card>
+          <p className="text-muted-foreground">Nenhuma atividade recente para exibir.</p>
+        </Card>
       </div>
     </div>
   );

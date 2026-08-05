@@ -1,7 +1,7 @@
 // CAMINHO: frontend/app/layout.tsx
 
 import type { Metadata } from 'next';
-import { poppins } from '@/lib/fonts';
+import { barlow, barlowCondensed } from '@/lib/fonts';
 import '@/styles/globals.css';
 import AuthProvider from '@/components/AuthProvider';
 
@@ -17,7 +17,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="pt-BR">
-      <body className={`${poppins.variable} font-poppins`}>
+      <body className={`${barlow.variable} ${barlowCondensed.variable} font-body`}>
         <AuthProvider>
           {children}
         </AuthProvider>

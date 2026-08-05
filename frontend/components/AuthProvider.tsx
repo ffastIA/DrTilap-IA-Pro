@@ -25,7 +25,6 @@ const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   useEffect(() => {
     if (!mounted || isLoading) return;
 
-    const publicRoutes = ['/', '/auth/login'];
     const protectedRoutes = ['/main'];
     const isProtectedRoute = protectedRoutes.some(route => pathname.startsWith(route));
 

@@ -13,7 +13,12 @@
 
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
+import Image from 'next/image';
 import { useResetPasswordMutation } from '@/hooks/useResetPasswordMutation';
+import Card from '@/components/ui/Card';
+import Field, { Input } from '@/components/ui/Field';
+import Alert from '@/components/ui/Alert';
+import Button from '@/components/Button';
 
 type CallbackState = 'loading' | 'confirmed' | 'recovery' | 'invalid';
 
@@ -88,137 +93,91 @@ export default function AuthCallbackPage() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-50 to-indigo-100 py-12 px-4 sm:px-6 lg:px-8">
-      <div className="max-w-md w-full space-y-8 bg-white p-8 rounded-2xl shadow-xl border border-gray-200">
-        <div>
-          <div className="mx-auto h-16 w-16 bg-gradient-to-r from-green-400 to-blue-500 rounded-2xl flex items-center justify-center mb-6">
-            <span className="text-2xl font-bold text-white">DT</span>
-          </div>
+    <Card corners className="w-full max-w-md p-8">
+      <div className="flex items-center gap-2 mb-6">
+        <Image src="/LogoTAI.jpeg" alt="Dr. Tilap-IA" width={32} height={27} />
+        <span className="font-heading font-semibold text-xl uppercase">Dr. Tilap-IA</span>
+      </div>
 
-          {state === 'loading' && (
-            <p className="mt-2 text-center text-sm text-gray-600">Verificando link...</p>
-          )}
+      {state === 'loading' && <p className="text-sm text-muted-foreground">Verificando link...</p>}
 
-          {state === 'confirmed' && (
-            <>
-              <h2 className="mt-6 text-center text-3xl font-bold tracking-tight text-gray-900">
-                Email Confirmado!
-              </h2>
-              <p className="mt-2 text-center text-sm text-gray-600">
-                Sua conta foi confirmada com sucesso. Já pode entrar no sistema.
-              </p>
-            </>
-          )}
+      {state === 'confirmed' && (
+        <>
+          <h1 className="font-heading font-semibold text-2xl uppercase m-0 mb-1">Email Confirmado!</h1>
+          <p className="text-sm text-muted-foreground mb-2">
+            Sua conta foi confirmada com sucesso. Já pode entrar no sistema.
+          </p>
+        </>
+      )}
 
+      {state === 'invalid' && (
+        <>
+          <h1 className="font-heading font-semibold text-2xl uppercase m-0 mb-1">Link Inválido</h1>
+          <p className="text-sm text-muted-foreground mb-2">Este link é inválido ou já expirou.</p>
+        </>
+      )}
+
+      {state === 'recovery' && !successMessage && (
+        <>
+          <h1 className="font-heading font-semibold text-2xl uppercase m-0 mb-1">Redefinir Senha</h1>
+          <p className="text-sm text-muted-foreground mb-6">Digite sua nova senha</p>
+        </>
+      )}
+
+      {state === 'recovery' && !successMessage && (
+        <form onSubmit={handleSubmit}>
+          <Field label="Nova senha" htmlFor="newPassword">
+            <Input
+              id="newPassword"
+              name="newPassword"
+              type="password"
+              required
+              placeholder="Pelo menos 6 caracteres"
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              disabled={isSubmitting}
+            />
+          </Field>
+          <Field label="Confirmar nova senha" htmlFor="confirmPassword">
+            <Input
+              id="confirmPassword"
+              name="confirmPassword"
+              type="password"
+              required
+              placeholder="Digite a senha novamente"
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              disabled={isSubmitting}
+            />
+          </Field>
+
+          {validationError && <Alert variant="error">{validationError}</Alert>}
+
+          <Button type="submit" variant="primary" disabled={isSubmitting} className="w-full">
+            {isSubmitting ? 'Redefinindo...' : 'Redefinir Senha'}
+          </Button>
+        </form>
+      )}
+
+      {successMessage && <Alert variant="success" className="mt-2">{successMessage}</Alert>}
+
+      {(state === 'confirmed' || state === 'invalid' || successMessage) && (
+        <div className="mt-6 pt-4 border-t border-border flex flex-col items-center gap-2">
+          <Link href="/auth/login" className="text-sm text-primary hover:text-primary-hover">
+            Ir para o login
+          </Link>
           {state === 'invalid' && (
             <>
-              <h2 className="mt-6 text-center text-3xl font-bold tracking-tight text-gray-900">
-                Link Inválido
-              </h2>
-              <p className="mt-2 text-center text-sm text-gray-600">
-                Este link é inválido ou já expirou.
-              </p>
-            </>
-          )}
-
-          {state === 'recovery' && !successMessage && (
-            <>
-              <h2 className="mt-6 text-center text-3xl font-bold tracking-tight text-gray-900">
-                Redefinir Senha
-              </h2>
-              <p className="mt-2 text-center text-sm text-gray-600">
-                Digite sua nova senha
-              </p>
+              <Link href="/auth/signup" className="text-sm text-primary hover:text-primary-hover">
+                Criar uma conta
+              </Link>
+              <Link href="/auth/forgot-password" className="text-sm text-primary hover:text-primary-hover">
+                Pedir novo link de redefinição
+              </Link>
             </>
           )}
         </div>
-
-        {state === 'recovery' && !successMessage && (
-          <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
-            <div className="space-y-4">
-              <div>
-                <label htmlFor="newPassword" className="block text-sm font-medium text-gray-700 mb-2">
-                  Nova senha
-                </label>
-                <input
-                  id="newPassword"
-                  name="newPassword"
-                  type="password"
-                  required
-                  className="appearance-none rounded-xl relative block w-full px-4 py-3 border border-gray-300 placeholder-gray-500 text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 sm:text-sm transition duration-200"
-                  placeholder="Pelo menos 6 caracteres"
-                  value={newPassword}
-                  onChange={(e) => setNewPassword(e.target.value)}
-                  disabled={isSubmitting}
-                />
-              </div>
-              <div>
-                <label htmlFor="confirmPassword" className="block text-sm font-medium text-gray-700 mb-2">
-                  Confirmar nova senha
-                </label>
-                <input
-                  id="confirmPassword"
-                  name="confirmPassword"
-                  type="password"
-                  required
-                  className="appearance-none rounded-xl relative block w-full px-4 py-3 border border-gray-300 placeholder-gray-500 text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 sm:text-sm transition duration-200"
-                  placeholder="Digite a senha novamente"
-                  value={confirmPassword}
-                  onChange={(e) => setConfirmPassword(e.target.value)}
-                  disabled={isSubmitting}
-                />
-              </div>
-            </div>
-
-            {validationError && (
-              <div className="bg-red-50 border border-red-200 text-red-800 px-4 py-3 rounded-xl text-sm">
-                {validationError}
-              </div>
-            )}
-
-            <div>
-              <button
-                type="submit"
-                disabled={isSubmitting}
-                className="group relative w-full flex justify-center py-3 px-4 border border-transparent text-sm font-bold rounded-xl text-white bg-gradient-to-r from-green-500 to-blue-600 hover:from-green-600 hover:to-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500 transition duration-200 disabled:opacity-50 disabled:cursor-not-allowed shadow-lg hover:shadow-xl"
-              >
-                {isSubmitting ? 'Redefinindo...' : 'Redefinir Senha'}
-              </button>
-            </div>
-          </form>
-        )}
-
-        {successMessage && (
-          <div className="mt-6 bg-green-50 border border-green-200 text-green-800 px-4 py-3 rounded-xl text-sm">
-            {successMessage}
-          </div>
-        )}
-
-        {(state === 'confirmed' || state === 'invalid' || successMessage) && (
-          <div className="mt-8">
-            <div className="relative">
-              <div className="absolute inset-0 flex items-center">
-                <div className="w-full border-t border-gray-300" />
-              </div>
-            </div>
-            <div className="mt-6 flex flex-col items-center gap-2">
-              <Link href="/auth/login" className="font-medium text-blue-600 hover:text-blue-500 text-sm">
-                Ir para o login
-              </Link>
-              {state === 'invalid' && (
-                <>
-                  <Link href="/auth/signup" className="font-medium text-blue-600 hover:text-blue-500 text-sm">
-                    Criar uma conta
-                  </Link>
-                  <Link href="/auth/forgot-password" className="font-medium text-blue-600 hover:text-blue-500 text-sm">
-                    Pedir novo link de redefinição
-                  </Link>
-                </>
-              )}
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
+      )}
+    </Card>
   );
 }

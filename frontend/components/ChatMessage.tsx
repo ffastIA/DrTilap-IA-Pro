@@ -43,15 +43,15 @@ const ChatMessage: React.FC<ChatMessageProps> = ({ message, isUser, sources }) =
   return (
     <div className={`flex mb-6 ${isUser ? 'justify-end' : 'justify-start'}`}>
       <div
-        className={`max-w-xs lg:max-w-md xl:max-w-lg px-4 py-3 rounded-lg ${
+        className={`max-w-xs lg:max-w-md xl:max-w-lg px-4 py-3 ${
           isUser
-            ? 'bg-primary text-white rounded-br-none'
-            : 'bg-surface text-text-secondary border border-gray-700 rounded-bl-none'
+            ? 'bg-primary text-primary-foreground'
+            : 'bg-surface text-foreground border border-border'
         }`}
       >
         <p className="text-sm leading-relaxed whitespace-pre-wrap break-words">{message}</p>
         {!isUser && sources && sources.length > 0 && (
-          <div className="mt-3 pt-2 border-t border-gray-700/50 text-xs text-text-secondary/80">
+          <div className="mt-3 pt-2 border-t border-border text-xs text-muted-foreground">
             <span className="font-medium">Fontes: </span>
             {sources.map(formatSource).join(' · ')}
           </div>

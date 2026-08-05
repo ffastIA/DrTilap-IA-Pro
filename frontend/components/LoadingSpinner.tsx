@@ -36,7 +36,7 @@ const LoadingSpinner: React.FC<LoadingSpinnerProps> = ({
           ></path>
         </svg>
       </div>
-      {text && <p className="text-text-secondary text-sm">{text}</p>}
+      {text && <p className="text-muted-foreground text-sm">{text}</p>}
     </div>
   );
 };

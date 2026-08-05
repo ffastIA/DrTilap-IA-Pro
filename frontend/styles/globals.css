@@ -2,20 +2,31 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+  Fonte única de verdade: frontend/lib/tokens.ts. Ao alterar um valor aqui,
+  replique-o lá (CSS não pode importar TS, então os dois arquivos precisam
+  ficar em sincronia manualmente).
+*/
 :root {
-  --color-primary: #00C853;
-  --color-secondary: #2196F3;
-  --color-accent: #FFC107;
-  --color-background: #1A1A1A;
-  --color-surface: #2C2C2C;
-  --color-text: #E0E0E0;
-  --color-text-secondary: #B0B0B0;
-  --color-glass-light: rgba(255, 255, 255, 0.1);
-  --color-glass-border: rgba(255, 255, 255, 0.2);
-  --color-error: #D32F2F;
-  --color-success: #388E3C;
-  --color-warning: #FBC02D;
-  --color-info: #0288D1;
+  --color-background: #f2f2f3;
+  --color-surface: #e9e9ea;
+  --color-card: #f2f2f3;
+  --color-foreground: #1d1f20;
+  --color-muted-foreground: #5d5e5f;
+  --color-border: #d0d0d1;
+
+  --color-primary: #5980a6;
+  --color-primary-hover: #597ea3;
+  --color-primary-active: #416180;
+  --color-primary-foreground: #f2f2f3;
+  --color-primary-soft: #eef6ff;
+
+  --color-ring: #5980a6;
+
+  --color-destructive: #a13f3a;
+  --color-destructive-bg: #f6e9e8;
+  --color-success: #3f6b4a;
+  --color-success-bg: #e9f1eb;
 }
 
 html, body {
@@ -25,20 +36,11 @@ html, body {
 }
 
 body {
-  background-color: #1A1A1A;
-  color: #E0E0E0;
+  background-color: var(--color-background);
+  color: var(--color-foreground);
   min-height: 100vh;
   display: flex;
   flex-direction: column;
-}
-
-.glass-effect {
-  background: rgba(255, 255, 255, 0.1);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
-  border-radius: 12px;
 }
 
 ::-webkit-scrollbar {
@@ -47,15 +49,15 @@ body {
 }
 
 ::-webkit-scrollbar-track {
-  background: #2C2C2C;
+  background: var(--color-surface);
   border-radius: 10px;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #00C853;
+  background: var(--color-border);
   border-radius: 10px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #2196F3;
+  background: var(--color-primary);
 }
