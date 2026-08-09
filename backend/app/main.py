@@ -21,6 +21,8 @@ from app.fish_schemas import (
     FishAnalysisListResponse, FishAnalysisDeleteResponse,
     ProcessRequest, ProcessResponse,
 )
+from app.services.user_profile_service import user_profile_service
+from app.profile_schemas import ProfileUpsertRequest, ProfileResponse
 
 from app.vector_admin_schemas import (
     VectorFileSummary,
@@ -161,6 +163,28 @@ async def reset_password(data: ResetPasswordRequest):
         logger.exception("[main.reset_password] erro inesperado")
         raise HTTPException(status_code=500, detail="Erro interno do servidor")
     return MessageResponse(message="Senha redefinida com sucesso.")
+
+@app.get("/profile", response_model=ProfileResponse)
+async def get_profile(current_user: dict = Depends(get_current_user)):
+    try:
+        data = user_profile_service.get_profile(current_user["id"], current_user["access_token"])
+        return ProfileResponse(**data)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception:
+        logger.exception("[main.get_profile] erro inesperado")
+        raise HTTPException(status_code=500, detail="Erro interno do servidor")
+
+@app.put("/profile", response_model=ProfileResponse)
+async def update_profile(data: ProfileUpsertRequest, current_user: dict = Depends(get_current_user)):
+    try:
+        result = user_profile_service.upsert_profile(current_user["id"], current_user["access_token"], data)
+        return ProfileResponse(**result)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception:
+        logger.exception("[main.update_profile] erro inesperado")
+        raise HTTPException(status_code=500, detail="Erro interno do servidor")
 
 @app.post("/consultoria/chat")
 async def chat(data: ChatRequest, current_user: dict = Depends(get_current_user)):

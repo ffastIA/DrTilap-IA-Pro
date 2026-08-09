@@ -7,6 +7,7 @@ interface User {
   id: string;
   email: string;
   role: 'admin' | 'user';
+  name?: string;
 }
 
 interface AuthStore {
@@ -15,11 +16,12 @@ interface AuthStore {
   isAuthenticated: boolean;
   isLoading: boolean;
   setAuth: (token: string, user: User) => void;
+  setUserName: (name: string) => void;
   clearAuth: () => void;
   restoreAuth: () => void;
 }
 
-export const useAuthStore = create<AuthStore>((set) => ({
+export const useAuthStore = create<AuthStore>((set, get) => ({
   token: null,
   user: null,
   isAuthenticated: false,
@@ -28,6 +30,13 @@ export const useAuthStore = create<AuthStore>((set) => ({
     Cookies.set('accessToken', token, { path: '/', sameSite: 'Lax' });
     Cookies.set('user', JSON.stringify(user), { path: '/', sameSite: 'Lax' });
     set({ token, user, isAuthenticated: true, isLoading: false });
+  },
+  setUserName: (name) => {
+    const currentUser = get().user;
+    if (!currentUser || currentUser.name === name) return;
+    const updatedUser = { ...currentUser, name };
+    Cookies.set('user', JSON.stringify(updatedUser), { path: '/', sameSite: 'Lax' });
+    set({ user: updatedUser });
   },
   clearAuth: () => {
     Cookies.remove('accessToken', { path: '/' });

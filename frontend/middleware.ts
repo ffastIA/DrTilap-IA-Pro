@@ -10,7 +10,19 @@
 //     forgot-password) ficam de fora dessa regra de propósito: alguém pode
 //     chegar ali por um link de email ainda com um cookie de sessão antigo
 //     no navegador, e não deve ser expulso antes de completar o fluxo.
-//  3. /main/admin  sem role=admin    → redireciona para /main/hub
+//  3. /main/* (exceto /main/profile) com perfil incompleto:
+//       - primeira tentativa na sessão → redireciona silenciosamente para
+//         /main/profile (não desloga)
+//       - tentativa seguinte (usuário já tentou sair uma vez) → desloga
+//         (limpa cookies de sessão) e redireciona para /auth/login
+//     "Perfil completo" = existe uma linha em public.user_profiles para o
+//     usuário (as colunas obrigatórias são NOT NULL, então a existência da
+//     linha já garante que os campos obrigatórios foram preenchidos — ver
+//     openspec/changes/add-profile-onboarding-gate/design.md).
+//     Este gate NÃO é um controle de segurança (o cookie profileComplete é
+//     gravável pelo navegador) — é só um empurrão de completude de cadastro,
+//     diferente do gate de admin abaixo, que sempre revalida contra a API.
+//  4. /main/admin  sem role=admin    → redireciona para /main/hub
 //     (o papel é verificado contra a API REST do Supabase usando o próprio
 //     access token do usuário — nunca a partir do cookie `user`, que é
 //     gravável pelo próprio navegador e não prova nada por si só. A policy
@@ -47,6 +59,36 @@ async function isAdminToken(token: string): Promise<boolean> {
   }
 }
 
+async function hasCompletedProfile(token: string): Promise<boolean> {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    // Configuração ausente — assume incompleto (mais restritivo) em vez de liberar por engano.
+    return false;
+  }
+  try {
+    const response = await fetch(`${SUPABASE_URL}/rest/v1/user_profiles?select=user_id&limit=1`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        apikey: SUPABASE_ANON_KEY,
+      },
+      cache: 'no-store',
+    });
+    if (!response.ok) {
+      return false;
+    }
+    const rows = (await response.json()) as { user_id?: string }[];
+    return Array.isArray(rows) && rows.length === 1;
+  } catch {
+    return false;
+  }
+}
+
+function clearSessionCookies(response: NextResponse): void {
+  response.cookies.delete('accessToken');
+  response.cookies.delete('user');
+  response.cookies.delete('profileGateSeen');
+  response.cookies.delete('profileComplete');
+}
+
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
@@ -70,7 +112,36 @@ export async function middleware(request: NextRequest) {
     return NextResponse.redirect(new URL('/main/hub', request.url));
   }
 
-  // ── Regra 3: /main/admin sem role=admin (verificado via API) → hub ────────
+  // ── Regra 3: gate de perfil incompleto (/main/* exceto /main/profile) ─────
+  if (isProtected && token && pathname !== '/main/profile') {
+    const profileCompleteCookie = request.cookies.get('profileComplete')?.value === '1';
+
+    if (!profileCompleteCookie) {
+      const complete = await hasCompletedProfile(token);
+
+      if (complete) {
+        const response = NextResponse.next();
+        response.cookies.set('profileComplete', '1', { path: '/', sameSite: 'lax' });
+        return response;
+      }
+
+      const alreadySeen = request.cookies.get('profileGateSeen')?.value === '1';
+
+      if (!alreadySeen) {
+        // Primeira tentativa nesta sessão: empurrão silencioso para o cadastro.
+        const response = NextResponse.redirect(new URL('/main/profile', request.url));
+        response.cookies.set('profileGateSeen', '1', { path: '/', sameSite: 'lax' });
+        return response;
+      }
+
+      // Já tinha recebido a chance de completar e tentou sair mesmo assim → desloga.
+      const response = NextResponse.redirect(new URL('/auth/login', request.url));
+      clearSessionCookies(response);
+      return response;
+    }
+  }
+
+  // ── Regra 4: /main/admin sem role=admin (verificado via API) → hub ────────
   if (pathname.startsWith('/main/admin') && token) {
     const isAdmin = await isAdminToken(token);
     if (!isAdmin) {

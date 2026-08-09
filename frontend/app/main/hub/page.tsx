@@ -7,6 +7,7 @@ import { useAuthStore } from '@/store/authStore';
 import { useRouter } from 'next/navigation';
 import Card from '@/components/ui/Card';
 import CornerMarks from '@/components/ui/CornerMarks';
+import { useProfile } from '@/hooks/useProfile';
 
 const FeatureCard: React.FC<{
   icon: React.ElementType;
@@ -30,6 +31,9 @@ export default function HubPage() {
   const clearAuth = useAuthStore((state) => state.clearAuth);
   const isAdmin = user?.role === 'admin';
   const router = useRouter();
+  // Só para popular user.name a partir do perfil (efeito colateral em setUserName);
+  // a página não usa `profile` diretamente.
+  useProfile();
 
   const handleLogout = () => {
     clearAuth();
@@ -40,7 +44,7 @@ export default function HubPage() {
     <div>
       <div className="flex justify-between items-start mb-8">
         <div>
-          <h1 className="font-heading font-semibold text-3xl uppercase mb-2">Bem-vindo, {user?.email}!</h1>
+          <h1 className="font-heading font-semibold text-3xl uppercase mb-2">Bem-vindo, {user?.name || user?.email}!</h1>
           <p className="text-muted-foreground">
             Explore as funcionalidades do Dr. Tilápia, seu assistente de IA para piscicultura.
           </p>
